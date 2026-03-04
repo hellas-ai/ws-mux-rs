@@ -1,0 +1,15 @@
+syntax = "proto3";
+package test;
+
+service TestService {
+  rpc Echo(EchoRequest) returns (EchoResponse);
+  rpc CountUp(CountRequest) returns (stream CountResponse);
+  rpc Sum(stream SumItem) returns (SumResponse);
+}
+
+message EchoRequest { uint32 value = 1; }
+message EchoResponse { uint32 value = 1; }
+message CountRequest { uint32 count = 1; }
+message CountResponse { uint32 value = 1; }
+message SumItem { uint32 value = 1; }
+message SumResponse { uint32 total = 1; }
