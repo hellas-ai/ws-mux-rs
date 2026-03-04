@@ -14,6 +14,13 @@ use crate::error;
 use crate::error::Error;
 use crate::frame::{self, Frame, flags};
 
+/// Maximum buffered bytes for a unary response payload.
+const MAX_UNARY_RESPONSE_PAYLOAD: usize = 4 * 1024 * 1024;
+/// Per-stream frame queue bound to avoid unbounded memory growth.
+const STREAM_QUEUE_CAPACITY: usize = 64;
+/// Retries when stream-id allocation collides after wrap-around.
+const MAX_STREAM_ID_ALLOCATION_ATTEMPTS: usize = 1024;
+
 /// Platform-appropriate shared pointer (Arc on native, Rc on wasm32).
 #[cfg(not(target_arch = "wasm32"))]
 type Shared<T> = Arc<T>;
@@ -44,7 +51,7 @@ struct Inner {
     /// Write side of the WebSocket (type-erased).
     send_fn: SendFn,
     /// Per-stream dispatch: incoming frames are routed here by the background reader.
-    streams: Mutex<HashMap<u32, mpsc::UnboundedSender<Frame>>>,
+    streams: Mutex<HashMap<u32, mpsc::Sender<Frame>>>,
 }
 
 impl MuxChannel {
@@ -86,7 +93,9 @@ impl MuxChannel {
             streams.get(&frame.stream_id).cloned()
         };
         if let Some(tx) = tx {
-            let _ = tx.send(frame);
+            if tx.send(frame).await.is_err() {
+                tracing::debug!("receiver dropped for stream");
+            }
         } else {
             tracing::debug!(
                 stream_id = frame.stream_id,
@@ -111,6 +120,24 @@ impl MuxChannel {
         self.inner.next_stream_id.fetch_add(2, Ordering::Relaxed)
     }
 
+    /// Allocate and register a new stream receiver, retrying collisions.
+    async fn alloc_and_register_stream(&self) -> Result<(u32, mpsc::Receiver<Frame>), Error> {
+        for _ in 0..MAX_STREAM_ID_ALLOCATION_ATTEMPTS {
+            let stream_id = self.alloc_stream_id();
+            let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
+            let mut streams = self.inner.streams.lock().await;
+            if let std::collections::hash_map::Entry::Vacant(entry) = streams.entry(stream_id) {
+                entry.insert(tx);
+                return Ok((stream_id, rx));
+            }
+            tracing::warn!(stream_id, "stream ID collision, retrying allocation");
+        }
+
+        Err(Error::Protocol(
+            "unable to allocate stream ID without collision".into(),
+        ))
+    }
+
     /// Return true when `stream_id` was initiated by this channel.
     ///
     /// The channel parity is invariant because IDs always increment by 2.
@@ -120,21 +147,9 @@ impl MuxChannel {
         (stream_id & 1) == parity
     }
 
-    /// Register a stream and return the receiver.
-    async fn register_stream(&self, stream_id: u32) -> mpsc::UnboundedReceiver<Frame> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut streams = self.inner.streams.lock().await;
-        debug_assert!(
-            !streams.contains_key(&stream_id),
-            "stream ID {stream_id} collision"
-        );
-        streams.insert(stream_id, tx);
-        rx
-    }
-
     /// Remove a stream from the dispatch table.
-    async fn deregister_stream(&self, stream_id: u32) {
-        self.inner.streams.lock().await.remove(&stream_id);
+    async fn deregister_stream(&self, stream_id: u32) -> bool {
+        self.inner.streams.lock().await.remove(&stream_id).is_some()
     }
 
     /// Send raw bytes through the WebSocket sink.
@@ -210,8 +225,7 @@ impl MuxChannel {
         method: u8,
         req: &Req,
     ) -> Result<Resp, Error> {
-        let stream_id = self.alloc_stream_id();
-        let mut rx = self.register_stream(stream_id).await;
+        let (stream_id, mut rx) = self.alloc_and_register_stream().await?;
 
         // Send OPEN|END with method index + encoded request.
         let payload = frame::build_open_payload(method, &req.encode_to_vec());
@@ -221,13 +235,13 @@ impl MuxChannel {
             payload,
         };
         if let Err(e) = self.send_raw(frame.encode()).await {
-            self.deregister_stream(stream_id).await;
+            let _ = self.deregister_stream(stream_id).await;
             return Err(e);
         }
 
         // Wait for the response frame(s).
         let resp = recv_unary_response::<Resp>(&mut rx).await;
-        self.deregister_stream(stream_id).await;
+        let _ = self.deregister_stream(stream_id).await;
         resp
     }
 
@@ -239,8 +253,7 @@ impl MuxChannel {
         method: u8,
         req: &Req,
     ) -> Result<Streaming, Error> {
-        let stream_id = self.alloc_stream_id();
-        let rx = self.register_stream(stream_id).await;
+        let (stream_id, rx) = self.alloc_and_register_stream().await?;
 
         // Send OPEN|END with method index + encoded request.
         let payload = frame::build_open_payload(method, &req.encode_to_vec());
@@ -250,7 +263,7 @@ impl MuxChannel {
             payload,
         };
         if let Err(e) = self.send_raw(frame.encode()).await {
-            self.deregister_stream(stream_id).await;
+            let _ = self.deregister_stream(stream_id).await;
             return Err(e);
         }
 
@@ -258,6 +271,7 @@ impl MuxChannel {
             channel: self.clone(),
             stream_id,
             rx,
+            ended: false,
         })
     }
 
@@ -269,8 +283,7 @@ impl MuxChannel {
         &self,
         method: u8,
     ) -> Result<(StreamingSender, ResponseFuture), Error> {
-        let stream_id = self.alloc_stream_id();
-        let rx = self.register_stream(stream_id).await;
+        let (stream_id, rx) = self.alloc_and_register_stream().await?;
 
         // Send OPEN (without END) with method index and empty payload.
         let payload = frame::build_open_payload(method, &[]);
@@ -280,7 +293,7 @@ impl MuxChannel {
             payload,
         };
         if let Err(e) = self.send_raw(frame.encode()).await {
-            self.deregister_stream(stream_id).await;
+            let _ = self.deregister_stream(stream_id).await;
             return Err(e);
         }
 
@@ -305,7 +318,7 @@ impl MuxChannel {
 
 /// Receive a unary response: collect DATA frames until END or RST.
 async fn recv_unary_response<Resp: Message + Default>(
-    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    rx: &mut mpsc::Receiver<Frame>,
 ) -> Result<Resp, Error> {
     let mut buf = Vec::new();
     loop {
@@ -319,13 +332,36 @@ async fn recv_unary_response<Resp: Message + Default>(
             });
         }
 
-        if frame.is_data() || frame.is_open() {
+        if frame.is_open() {
+            return Err(Error::Protocol(
+                "received OPEN frame on unary response stream".into(),
+            ));
+        }
+
+        if frame.is_data() {
+            if buf.len().saturating_add(frame.payload.len()) > MAX_UNARY_RESPONSE_PAYLOAD {
+                return Err(Error::Protocol(format!(
+                    "unary response exceeded max payload of {MAX_UNARY_RESPONSE_PAYLOAD} bytes"
+                )));
+            }
             buf.extend_from_slice(&frame.payload);
+
+            if frame.is_end() {
+                return Resp::decode(buf.as_slice()).map_err(Error::from);
+            }
+            continue;
         }
 
         if frame.is_end() {
-            return Resp::decode(buf.as_slice()).map_err(Error::from);
+            return Err(Error::Protocol(
+                "received END without DATA on unary response stream".into(),
+            ));
         }
+
+        return Err(Error::Protocol(format!(
+            "unexpected unary response frame flags: 0x{:02x}",
+            frame.flags
+        )));
     }
 }
 
@@ -333,7 +369,8 @@ async fn recv_unary_response<Resp: Message + Default>(
 pub struct Streaming {
     channel: MuxChannel,
     stream_id: u32,
-    rx: mpsc::UnboundedReceiver<Frame>,
+    rx: mpsc::Receiver<Frame>,
+    ended: bool,
 }
 
 impl Streaming {
@@ -341,11 +378,12 @@ impl Streaming {
     ///
     /// Returns `Ok(None)` when the stream ends normally.
     pub async fn message<T: Message + Default>(&mut self) -> Result<Option<T>, Error> {
+        if self.ended {
+            return Ok(None);
+        }
+
         loop {
-            let frame = match self.rx.recv().await {
-                Some(f) => f,
-                None => return Ok(None),
-            };
+            let frame = self.rx.recv().await.ok_or(Error::Closed)?;
 
             if frame.is_rst() {
                 let (code, msg) = frame::parse_rst_payload(&frame.payload)?;
@@ -355,18 +393,37 @@ impl Streaming {
                 });
             }
 
-            // DATA|END with empty payload = end-of-stream marker
-            if frame.is_end() && frame.payload.is_empty() {
-                return Ok(None);
+            if frame.is_open() {
+                return Err(Error::Protocol(
+                    "received OPEN frame on server-stream response stream".into(),
+                ));
             }
 
-            if frame.is_data() || frame.is_open() {
+            if frame.is_data() {
+                if frame.is_end() && frame.payload.is_empty() {
+                    self.ended = true;
+                    return Ok(None);
+                }
                 if frame.payload.is_empty() {
                     continue;
                 }
                 let msg = T::decode(frame.payload.as_slice())?;
+                if frame.is_end() {
+                    self.ended = true;
+                }
                 return Ok(Some(msg));
             }
+
+            if frame.is_end() {
+                return Err(Error::Protocol(
+                    "received END without DATA on server-stream response stream".into(),
+                ));
+            }
+
+            return Err(Error::Protocol(format!(
+                "unexpected server-stream response frame flags: 0x{:02x}",
+                frame.flags
+            )));
         }
     }
 }
@@ -376,17 +433,20 @@ impl Drop for Streaming {
         let channel = self.channel.clone();
         let stream_id = self.stream_id;
         #[cfg(not(target_arch = "wasm32"))]
+        let should_notify_server = !self.ended;
+        #[cfg(not(target_arch = "wasm32"))]
         {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    // Notify the server we're no longer interested.
-                    let rst = Frame {
-                        stream_id,
-                        flags: flags::RST,
-                        payload: frame::build_rst_payload(error::code::CANCELLED, "cancelled"),
-                    };
-                    let _ = channel.send_raw(rst.encode()).await;
-                    channel.deregister_stream(stream_id).await;
+                    if channel.deregister_stream(stream_id).await && should_notify_server {
+                        // Notify the server we're no longer interested.
+                        let rst = Frame {
+                            stream_id,
+                            flags: flags::RST,
+                            payload: frame::build_rst_payload(error::code::CANCELLED, "cancelled"),
+                        };
+                        let _ = channel.send_raw(rst.encode()).await;
+                    }
                 });
             } else if let Ok(mut streams) = channel.inner.streams.try_lock() {
                 streams.remove(&stream_id);
@@ -441,6 +501,34 @@ impl Drop for StreamingSender {
     fn drop(&mut self) {
         if let Some(done) = self.done.take() {
             let _ = done.send(());
+            let channel = self.channel.clone();
+            let stream_id = self.stream_id;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        if channel.deregister_stream(stream_id).await {
+                            let rst = Frame {
+                                stream_id,
+                                flags: flags::RST,
+                                payload: frame::build_rst_payload(
+                                    error::code::CANCELLED,
+                                    "cancelled",
+                                ),
+                            };
+                            let _ = channel.send_raw(rst.encode()).await;
+                        }
+                    });
+                } else if let Ok(mut streams) = channel.inner.streams.try_lock() {
+                    streams.remove(&stream_id);
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                if let Ok(mut streams) = channel.inner.streams.try_lock() {
+                    streams.remove(&stream_id);
+                }
+            }
         }
     }
 }
@@ -449,7 +537,7 @@ impl Drop for StreamingSender {
 pub struct ResponseFuture {
     channel: MuxChannel,
     stream_id: u32,
-    rx: mpsc::UnboundedReceiver<Frame>,
+    rx: mpsc::Receiver<Frame>,
     sender_done: Option<oneshot::Receiver<()>>,
 }
 
@@ -463,7 +551,7 @@ impl ResponseFuture {
         }
 
         let result = recv_unary_response::<T>(&mut self.rx).await;
-        self.channel.deregister_stream(self.stream_id).await;
+        let _ = self.channel.deregister_stream(self.stream_id).await;
         result
     }
 }
@@ -476,7 +564,14 @@ impl Drop for ResponseFuture {
         {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    channel.deregister_stream(stream_id).await;
+                    if channel.deregister_stream(stream_id).await {
+                        let rst = Frame {
+                            stream_id,
+                            flags: flags::RST,
+                            payload: frame::build_rst_payload(error::code::CANCELLED, "cancelled"),
+                        };
+                        let _ = channel.send_raw(rst.encode()).await;
+                    }
                 });
             } else if let Ok(mut streams) = channel.inner.streams.try_lock() {
                 streams.remove(&stream_id);
@@ -495,6 +590,7 @@ impl Drop for ResponseFuture {
 mod tests {
     use super::*;
     use prost::Message;
+    use std::sync::Arc;
 
     #[derive(Clone, PartialEq, Message)]
     struct TestMsg {
@@ -554,5 +650,104 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(channel.inner.streams.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_streaming_sender_sends_rst() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let send_fn: SendFn = {
+            let sent = sent.clone();
+            Arc::new(move |data: Vec<u8>| {
+                let sent = sent.clone();
+                Box::pin(async move {
+                    let frame = Frame::decode(&data)?;
+                    sent.lock().await.push(frame);
+                    Ok(())
+                })
+            })
+        };
+        let channel = MuxChannel::new(send_fn);
+
+        let (sender, _resp) = channel.client_streaming(2).await.expect("open stream");
+        drop(sender);
+
+        for _ in 0..100 {
+            if sent.lock().await.iter().any(Frame::is_rst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(sent.lock().await.iter().any(Frame::is_rst));
+    }
+
+    #[tokio::test]
+    async fn dropping_response_future_sends_rst() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let send_fn: SendFn = {
+            let sent = sent.clone();
+            Arc::new(move |data: Vec<u8>| {
+                let sent = sent.clone();
+                Box::pin(async move {
+                    let frame = Frame::decode(&data)?;
+                    sent.lock().await.push(frame);
+                    Ok(())
+                })
+            })
+        };
+        let channel = MuxChannel::new(send_fn);
+
+        let (sender, resp) = channel.client_streaming(2).await.expect("open stream");
+        sender.close().await.expect("close stream");
+        drop(resp);
+
+        for _ in 0..100 {
+            if sent.lock().await.iter().any(Frame::is_rst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(sent.lock().await.iter().any(Frame::is_rst));
+    }
+
+    #[tokio::test]
+    async fn recv_unary_rejects_open_response_frame() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.send(Frame {
+            stream_id: 1,
+            flags: flags::OPEN | flags::END,
+            payload: frame::build_open_payload(0, &[]),
+        })
+        .await
+        .expect("send test frame");
+        drop(tx);
+
+        let result: Result<TestMsg, Error> = recv_unary_response(&mut rx).await;
+        assert!(matches!(result, Err(Error::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn streaming_message_rejects_unexpected_flags() {
+        let send_fn: SendFn = Arc::new(|_data: Vec<u8>| Box::pin(async { Ok(()) }));
+        let channel = MuxChannel::new(send_fn);
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(Frame {
+            stream_id: 1,
+            flags: flags::END,
+            payload: vec![1],
+        })
+        .await
+        .expect("send test frame");
+        drop(tx);
+
+        let mut stream = Streaming {
+            channel,
+            stream_id: 1,
+            rx,
+            ended: false,
+        };
+        let result: Result<Option<TestMsg>, Error> = stream.message().await;
+        assert!(matches!(result, Err(Error::Protocol(_))));
     }
 }

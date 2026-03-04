@@ -463,13 +463,23 @@ fn gen_client(service: &prost_build::Service) -> TokenStream {
 }
 
 fn to_snake_case(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 4);
-    for (i, ch) in s.chars().enumerate() {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(chars.len() + 4);
+    for (i, ch) in chars.iter().copied().enumerate() {
+        let prev = i.checked_sub(1).and_then(|j| chars.get(j).copied());
+        let next = chars.get(i + 1).copied();
         if ch.is_uppercase() {
-            if i > 0 {
+            let prev_is_lower_or_digit = prev.is_some_and(|c| c.is_lowercase() || c.is_ascii_digit());
+            let prev_is_upper = prev.is_some_and(char::is_uppercase);
+            let next_is_lower = next.is_some_and(char::is_lowercase);
+            if i > 0 && (prev_is_lower_or_digit || (prev_is_upper && next_is_lower)) {
                 out.push('_');
             }
             out.extend(ch.to_lowercase());
+        } else if ch == '-' || ch == ' ' {
+            if !out.ends_with('_') && !out.is_empty() {
+                out.push('_');
+            }
         } else {
             out.push(ch);
         }
@@ -478,7 +488,7 @@ fn to_snake_case(s: &str) -> String {
 }
 
 fn to_screaming_snake_case(s: &str) -> String {
-    s.to_uppercase()
+    to_snake_case(s).to_uppercase()
 }
 
 fn to_upper_camel_case(s: &str) -> String {

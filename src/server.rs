@@ -84,6 +84,10 @@ impl<T: WsSink> ServerSink for T {
 
 /// Maximum accumulated payload size per client-streaming RPC (4 MiB).
 const MAX_CLIENT_STREAM_PAYLOAD: usize = 4 * 1024 * 1024;
+/// Maximum accumulated payload size across all active client streams (64 MiB).
+const MAX_TOTAL_CLIENT_STREAM_PAYLOAD: usize = 64 * 1024 * 1024;
+/// Idle timeout for active client-streaming RPCs.
+const CLIENT_STREAM_IDLE_TIMEOUT_MS: u64 = 60_000;
 
 /// Maximum number of concurrently open client-streaming RPCs.
 const MAX_ACTIVE_CLIENT_STREAMS: usize = 256;
@@ -101,6 +105,13 @@ fn delimited_chunk_len(payload_len: usize) -> usize {
     varint_len(payload_len as u64).saturating_add(payload_len)
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Accumulation state for client-streaming RPCs.
 ///
 /// Tracks partial streams where the client has sent OPEN but not yet END.
@@ -109,6 +120,44 @@ fn delimited_chunk_len(payload_len: usize) -> usize {
 pub struct StreamState {
     /// Active client-streaming streams: stream_id -> (method_index, accumulated payload bytes).
     pub active: std::collections::HashMap<u32, (u8, Vec<u8>)>,
+    /// Last observed activity timestamp per stream (`unix_ms`).
+    pub last_activity_ms: std::collections::HashMap<u32, u64>,
+    /// Total buffered bytes across all active client streams.
+    pub total_active_payload_bytes: usize,
+}
+
+impl StreamState {
+    fn insert_stream(&mut self, stream_id: u32, method_index: u8, payload: Vec<u8>, now_ms: u64) {
+        self.total_active_payload_bytes = self
+            .total_active_payload_bytes
+            .saturating_add(payload.len());
+        self.active.insert(stream_id, (method_index, payload));
+        self.last_activity_ms.insert(stream_id, now_ms);
+    }
+
+    fn remove_stream(&mut self, stream_id: u32) -> Option<(u8, Vec<u8>)> {
+        let removed = self.active.remove(&stream_id);
+        if let Some((_, payload)) = &removed {
+            self.total_active_payload_bytes = self
+                .total_active_payload_bytes
+                .saturating_sub(payload.len());
+        }
+        self.last_activity_ms.remove(&stream_id);
+        removed
+    }
+
+    fn prune_idle_streams(&mut self, now_ms: u64) -> Vec<u32> {
+        let mut expired = Vec::new();
+        for (&stream_id, &last) in &self.last_activity_ms {
+            if now_ms.saturating_sub(last) > CLIENT_STREAM_IDLE_TIMEOUT_MS {
+                expired.push(stream_id);
+            }
+        }
+        for stream_id in &expired {
+            let _ = self.remove_stream(*stream_id);
+        }
+        expired
+    }
 }
 
 /// Handle a single incoming WebSocket message (one frame) on the server side.
@@ -121,16 +170,19 @@ async fn handle_decoded_frame<S: ServiceDispatch>(
     sink: &dyn ServerSink,
     streams: &mut StreamState,
 ) -> Result<(), Error> {
-    enum ClientStreamUpdate {
-        Unknown,
-        TooLarge,
-        Pending,
-        Dispatch { method: u8, payload: Vec<u8> },
+    let now = now_ms();
+    for expired_stream_id in streams.prune_idle_streams(now) {
+        let rst = Frame {
+            stream_id: expired_stream_id,
+            flags: flags::RST,
+            payload: frame::build_rst_payload(error::code::CANCELLED, "client stream idle timeout"),
+        };
+        sink.send_frame(rst).await?;
     }
 
     if frame.is_rst() {
         // Client cancelled a stream. Clean up any accumulation state.
-        streams.active.remove(&frame.stream_id);
+        let _ = streams.remove_stream(frame.stream_id);
         return Ok(());
     }
 
@@ -185,6 +237,22 @@ async fn handle_decoded_frame<S: ServiceDispatch>(
                 sink.send_frame(rst).await?;
                 return Ok(());
             }
+            if streams
+                .total_active_payload_bytes
+                .saturating_add(initial_chunk_len)
+                > MAX_TOTAL_CLIENT_STREAM_PAYLOAD
+            {
+                let rst = Frame {
+                    stream_id: frame.stream_id,
+                    flags: flags::RST,
+                    payload: frame::build_rst_payload(
+                        error::code::UNAVAILABLE,
+                        "aggregate client stream payload too large",
+                    ),
+                };
+                sink.send_frame(rst).await?;
+                return Ok(());
+            }
             // Length-delimit the initial payload (if any) so the accumulated
             // buffer is compatible with decode_length_delimited in dispatch.
             let mut buf = Vec::with_capacity(initial_chunk_len);
@@ -192,51 +260,30 @@ async fn handle_decoded_frame<S: ServiceDispatch>(
                 prost::encoding::encode_varint(payload.len() as u64, &mut buf);
                 buf.extend_from_slice(payload);
             }
-            streams.active.insert(frame.stream_id, (method_index, buf));
+            streams.insert_stream(frame.stream_id, method_index, buf, now);
         }
-    } else if frame.is_data() {
-        let update = if let Some((method_index, buf)) = streams.active.get_mut(&frame.stream_id) {
+        return Ok(());
+    }
+
+    if frame.is_data() {
+        if let Some((method_index, mut buf)) = streams.remove_stream(frame.stream_id) {
             if frame.is_end() && frame.payload.is_empty() {
                 // DATA|END with empty payload is an end marker, not an extra empty message.
-                ClientStreamUpdate::Dispatch {
-                    method: *method_index,
-                    payload: std::mem::take(buf),
-                }
-            } else {
-                let added = delimited_chunk_len(frame.payload.len());
-                if buf.len().saturating_add(added) > MAX_CLIENT_STREAM_PAYLOAD {
-                    ClientStreamUpdate::TooLarge
-                } else {
-                    // Length-delimit each message so the accumulated buffer
-                    // is compatible with decode_length_delimited in dispatch.
-                    prost::encoding::encode_varint(frame.payload.len() as u64, buf);
-                    buf.extend_from_slice(&frame.payload);
-
-                    if frame.is_end() {
-                        // Client-streaming complete: dispatch with accumulated payload.
-                        ClientStreamUpdate::Dispatch {
-                            method: *method_index,
-                            payload: std::mem::take(buf),
-                        }
-                    } else {
-                        ClientStreamUpdate::Pending
-                    }
-                }
-            }
-        } else {
-            ClientStreamUpdate::Unknown
-        };
-
-        match update {
-            ClientStreamUpdate::Pending => {}
-            ClientStreamUpdate::Dispatch { method, payload } => {
-                streams.active.remove(&frame.stream_id);
                 service
-                    .dispatch(frame.stream_id, method, &payload, sink)
+                    .dispatch(frame.stream_id, method_index, &buf, sink)
                     .await?;
+                return Ok(());
             }
-            ClientStreamUpdate::TooLarge => {
-                streams.active.remove(&frame.stream_id);
+
+            if frame.payload.is_empty() {
+                // Ignore empty DATA chunks that are not terminators.
+                streams.insert_stream(frame.stream_id, method_index, buf, now);
+                return Ok(());
+            }
+
+            let added = delimited_chunk_len(frame.payload.len());
+            let new_len = buf.len().saturating_add(added);
+            if new_len > MAX_CLIENT_STREAM_PAYLOAD {
                 let rst = Frame {
                     stream_id: frame.stream_id,
                     flags: flags::RST,
@@ -246,20 +293,61 @@ async fn handle_decoded_frame<S: ServiceDispatch>(
                     ),
                 };
                 sink.send_frame(rst).await?;
+                return Ok(());
             }
-            // DATA for unknown stream — send RST.
-            ClientStreamUpdate::Unknown => {
+
+            if streams.total_active_payload_bytes.saturating_add(new_len)
+                > MAX_TOTAL_CLIENT_STREAM_PAYLOAD
+            {
                 let rst = Frame {
                     stream_id: frame.stream_id,
                     flags: flags::RST,
                     payload: frame::build_rst_payload(
-                        error::code::INVALID_ARGUMENT,
-                        "DATA for unknown stream",
+                        error::code::UNAVAILABLE,
+                        "aggregate client stream payload too large",
                     ),
                 };
                 sink.send_frame(rst).await?;
+                return Ok(());
             }
+
+            // Length-delimit each message so the accumulated buffer
+            // is compatible with decode_length_delimited in dispatch.
+            prost::encoding::encode_varint(frame.payload.len() as u64, &mut buf);
+            buf.extend_from_slice(&frame.payload);
+
+            if frame.is_end() {
+                service
+                    .dispatch(frame.stream_id, method_index, &buf, sink)
+                    .await?;
+                return Ok(());
+            }
+
+            streams.insert_stream(frame.stream_id, method_index, buf, now);
+            return Ok(());
         }
+
+        // DATA for unknown stream — send RST.
+        let rst = Frame {
+            stream_id: frame.stream_id,
+            flags: flags::RST,
+            payload: frame::build_rst_payload(
+                error::code::INVALID_ARGUMENT,
+                "DATA for unknown stream",
+            ),
+        };
+        sink.send_frame(rst).await?;
+        return Ok(());
+    } else {
+        let rst = Frame {
+            stream_id: frame.stream_id,
+            flags: flags::RST,
+            payload: frame::build_rst_payload(
+                error::code::INVALID_ARGUMENT,
+                "unknown or unsupported frame flags",
+            ),
+        };
+        sink.send_frame(rst).await?;
     }
 
     Ok(())
@@ -370,7 +458,7 @@ where
             });
         } else {
             // Client-streaming: needs sequential state management.
-            if let Err(e) = handle_frame(&service, &msg, &sink, &mut streams).await {
+            if let Err(e) = handle_decoded_frame(&service, frame, &sink, &mut streams).await {
                 tracing::warn!(error = %e, "handle_frame error");
             }
         }
@@ -472,5 +560,95 @@ where
                 Some(Err(e)) => return Err(Error::Io(std::io::Error::other(e))),
             }
         }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct NoopService;
+
+    impl ServiceDispatch for NoopService {
+        async fn dispatch(
+            &self,
+            _stream_id: u32,
+            _method_index: u8,
+            _payload: &[u8],
+            _sink: &dyn ServerSink,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct TestSink(Arc<Mutex<Vec<Frame>>>);
+
+    impl WsSink for TestSink {
+        async fn send(&self, data: Vec<u8>) -> Result<(), Error> {
+            let frame = Frame::decode(&data)?;
+            self.0.lock().await.push(frame);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn prune_idle_streams_reclaims_payload_bytes() {
+        let mut state = StreamState::default();
+        state.insert_stream(1, 0, vec![0; 10], 100);
+        state.insert_stream(3, 0, vec![0; 20], 200);
+
+        let expired = state.prune_idle_streams(100 + CLIENT_STREAM_IDLE_TIMEOUT_MS + 1);
+        assert_eq!(expired, vec![1]);
+        assert!(state.active.contains_key(&3));
+        assert!(!state.active.contains_key(&1));
+        assert_eq!(state.total_active_payload_bytes, 20);
+    }
+
+    #[tokio::test]
+    async fn aggregate_cap_rejects_new_open_stream() {
+        let service = NoopService;
+        let sink = TestSink::default();
+        let mut state = StreamState {
+            total_active_payload_bytes: MAX_TOTAL_CLIENT_STREAM_PAYLOAD,
+            ..Default::default()
+        };
+
+        let frame = Frame {
+            stream_id: 1,
+            flags: flags::OPEN,
+            payload: frame::build_open_payload(0, &[42]),
+        };
+        handle_frame(&service, &frame.encode(), &sink, &mut state)
+            .await
+            .expect("handle frame");
+
+        let sent = sink.0.lock().await;
+        assert!(sent.iter().any(|f| f.is_rst()));
+        assert!(state.active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_idle_streams_emits_rst_during_handle_frame() {
+        let service = NoopService;
+        let sink = TestSink::default();
+        let mut state = StreamState::default();
+        state.insert_stream(1, 0, vec![7], 0);
+
+        let frame = Frame {
+            stream_id: 9,
+            flags: flags::OPEN | flags::END,
+            payload: frame::build_open_payload(0, &[]),
+        };
+        handle_frame(&service, &frame.encode(), &sink, &mut state)
+            .await
+            .expect("handle frame");
+
+        let sent = sink.0.lock().await;
+        assert!(sent.iter().any(|f| f.stream_id == 1 && f.is_rst()));
+        assert!(!state.active.contains_key(&1));
     }
 }

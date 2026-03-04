@@ -68,6 +68,12 @@ impl MuxChannel {
     /// Installs `onmessage` and `onclose` handlers for frame routing.
     pub fn from_ws(ws: web_sys::WebSocket) -> Result<Self, Error> {
         ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
+        if ws.ready_state() != web_sys::WebSocket::OPEN {
+            return Err(Error::Connect(format!(
+                "from_ws requires an OPEN websocket, got ready_state={}",
+                ws.ready_state()
+            )));
+        }
 
         let ws_clone = ws.clone();
         let send_fn: SendFn = Rc::new(move |data: Vec<u8>| {
