@@ -122,7 +122,7 @@ impl MuxChannel {
             Closure::<dyn FnMut(web_sys::CloseEvent)>::new(move |_: web_sys::CloseEvent| {
                 let ch = on_close_channel.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    ch.close_all_streams().await;
+                    ch.transport_closed().await;
                 });
                 tracing::debug!("ws-mux wasm connection closed");
             });
@@ -134,7 +134,7 @@ impl MuxChannel {
         let on_error = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
             let ch = on_error_channel.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                ch.close_all_streams().await;
+                ch.transport_closed().await;
             });
             tracing::debug!("ws-mux wasm connection error");
         });

@@ -9,7 +9,6 @@ use std::sync::Arc;
 use prost::Message;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-#[cfg(not(target_arch = "wasm32"))]
 use crate::error;
 use crate::error::Error;
 use crate::frame::{self, Frame, flags};
@@ -88,17 +87,35 @@ impl MuxChannel {
     ///
     /// Called by the background reader task for each received WebSocket message.
     pub async fn route_frame(&self, frame: Frame) {
+        let stream_id = frame.stream_id;
         let tx = {
             let streams = self.inner.streams.lock().await;
-            streams.get(&frame.stream_id).cloned()
+            streams.get(&stream_id).cloned()
         };
         if let Some(tx) = tx {
-            if tx.send(frame).await.is_err() {
-                tracing::debug!("receiver dropped for stream");
+            match tx.try_send(frame) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!(stream_id, "receiver dropped for stream");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(stream_id, "response stream queue full, cancelling stream");
+                    if self.deregister_stream(stream_id).await {
+                        let rst = Frame {
+                            stream_id,
+                            flags: flags::RST,
+                            payload: frame::build_rst_payload(
+                                error::code::CANCELLED,
+                                "response stream queue full",
+                            ),
+                        };
+                        let _ = self.send_raw(rst.encode()).await;
+                    }
+                }
             }
         } else {
             tracing::debug!(
-                stream_id = frame.stream_id,
+                stream_id,
                 "no receiver for frame, dropping"
             );
         }
@@ -213,9 +230,12 @@ impl MuxChannel {
         Self::new_even(send_fn)
     }
 
-    /// Drop all active stream senders so waiting receivers wake with `Error::Closed`.
-    #[cfg(any(feature = "native-client", feature = "wasm-client", test))]
-    pub(crate) async fn close_all_streams(&self) {
+    /// Notify the channel that the underlying transport has closed.
+    ///
+    /// This wakes all pending RPC receivers with [`Error::Closed`]. Embedders
+    /// using custom transports should call this when their WebSocket or
+    /// equivalent transport reaches EOF or a terminal error state.
+    pub async fn transport_closed(&self) {
         self.inner.streams.lock().await.clear();
     }
 
@@ -374,6 +394,11 @@ pub struct Streaming {
 }
 
 impl Streaming {
+    async fn finish(&mut self) {
+        self.ended = true;
+        let _ = self.channel.deregister_stream(self.stream_id).await;
+    }
+
     /// Receive the next message from the stream.
     ///
     /// Returns `Ok(None)` when the stream ends normally.
@@ -387,9 +412,11 @@ impl Streaming {
 
             if frame.is_rst() {
                 let (code, msg) = frame::parse_rst_payload(&frame.payload)?;
+                let message = msg.to_owned();
+                self.finish().await;
                 return Err(Error::Status {
                     code,
-                    message: msg.to_owned(),
+                    message,
                 });
             }
 
@@ -401,7 +428,7 @@ impl Streaming {
 
             if frame.is_data() {
                 if frame.is_end() && frame.payload.is_empty() {
-                    self.ended = true;
+                    self.finish().await;
                     return Ok(None);
                 }
                 if frame.payload.is_empty() {
@@ -409,7 +436,7 @@ impl Streaming {
                 }
                 let msg = T::decode(frame.payload.as_slice())?;
                 if frame.is_end() {
-                    self.ended = true;
+                    self.finish().await;
                 }
                 return Ok(Some(msg));
             }
@@ -627,7 +654,7 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        channel.close_all_streams().await;
+        channel.transport_closed().await;
 
         let result = call.await.expect("task join");
         assert!(matches!(result, Err(Error::Closed)));
@@ -749,5 +776,127 @@ mod tests {
         };
         let result: Result<Option<TestMsg>, Error> = stream.message().await;
         assert!(matches!(result, Err(Error::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn streaming_end_deregisters_stream_immediately() {
+        let send_fn: SendFn = Arc::new(|_data: Vec<u8>| Box::pin(async { Ok(()) }));
+        let channel = MuxChannel::new(send_fn);
+        let (stream_id, rx) = channel.alloc_and_register_stream().await.expect("register stream");
+
+        let tx = channel
+            .inner
+            .streams
+            .lock()
+            .await
+            .get(&stream_id)
+            .cloned()
+            .expect("stream sender");
+
+        tx.send(Frame {
+            stream_id,
+            flags: flags::DATA,
+            payload: TestMsg { value: 7 }.encode_to_vec(),
+        })
+        .await
+        .expect("send data frame");
+        tx.send(Frame {
+            stream_id,
+            flags: flags::DATA | flags::END,
+            payload: vec![],
+        })
+        .await
+        .expect("send end frame");
+
+        let mut stream = Streaming {
+            channel: channel.clone(),
+            stream_id,
+            rx,
+            ended: false,
+        };
+
+        let msg: TestMsg = stream
+            .message()
+            .await
+            .expect("first message result")
+            .expect("first message payload");
+        assert_eq!(msg.value, 7);
+        assert!(channel.inner.streams.lock().await.contains_key(&stream_id));
+
+        let end: Option<TestMsg> = stream.message().await.expect("stream end");
+        assert!(end.is_none());
+        assert!(!channel.inner.streams.lock().await.contains_key(&stream_id));
+    }
+
+    #[tokio::test]
+    async fn full_stream_queue_does_not_block_other_routes() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let send_fn: SendFn = {
+            let sent = sent.clone();
+            Arc::new(move |data: Vec<u8>| {
+                let sent = sent.clone();
+                Box::pin(async move {
+                    sent.lock().await.push(Frame::decode(&data)?);
+                    Ok(())
+                })
+            })
+        };
+        let channel = MuxChannel::new(send_fn);
+        let (slow_stream_id, _slow_rx) = channel
+            .alloc_and_register_stream()
+            .await
+            .expect("register slow stream");
+        let (fast_stream_id, mut fast_rx) = channel
+            .alloc_and_register_stream()
+            .await
+            .expect("register fast stream");
+
+        for value in 0..STREAM_QUEUE_CAPACITY {
+            channel
+                .route_frame(Frame {
+                    stream_id: slow_stream_id,
+                    flags: flags::DATA,
+                    payload: TestMsg {
+                        value: value as u32,
+                    }
+                    .encode_to_vec(),
+                })
+                .await;
+        }
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            channel.route_frame(Frame {
+                stream_id: slow_stream_id,
+                flags: flags::DATA,
+                payload: TestMsg { value: 999 }.encode_to_vec(),
+            }),
+        )
+        .await
+        .expect("slow stream overflow should not block routing");
+
+        channel
+            .route_frame(Frame {
+                stream_id: fast_stream_id,
+                flags: flags::DATA | flags::END,
+                payload: TestMsg { value: 7 }.encode_to_vec(),
+            })
+            .await;
+
+        let fast_frame = tokio::time::timeout(std::time::Duration::from_secs(1), fast_rx.recv())
+            .await
+            .expect("fast stream should still receive frames")
+            .expect("fast frame");
+        let fast_msg = TestMsg::decode(fast_frame.payload.as_slice()).expect("decode fast message");
+
+        assert_eq!(fast_msg.value, 7);
+        assert!(!channel.inner.streams.lock().await.contains_key(&slow_stream_id));
+        assert!(sent.lock().await.iter().any(|frame| {
+            frame.stream_id == slow_stream_id
+                && frame.is_rst()
+                && frame::parse_rst_payload(&frame.payload)
+                    .map(|(code, msg)| code == error::code::CANCELLED && msg == "response stream queue full")
+                    .unwrap_or(false)
+        }));
     }
 }

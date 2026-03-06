@@ -58,7 +58,7 @@ impl MuxChannel {
                     }
                 }
             }
-            channel_clone.close_all_streams().await;
+            channel_clone.transport_closed().await;
             tracing::debug!("ws reader exited");
         });
 

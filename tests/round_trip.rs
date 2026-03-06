@@ -479,3 +479,35 @@ async fn bidi_routes_remote_client_streaming_frames() {
     let resp = EchoResponse::decode(frame.payload.as_slice()).expect("valid response payload");
     assert_eq!(resp.value, 2);
 }
+
+#[tokio::test]
+async fn transport_closed_wakes_pending_unary_for_custom_transports() {
+    let (sent_tx, sent_rx) = tokio::sync::oneshot::channel::<()>();
+    let sent_tx = Arc::new(tokio::sync::Mutex::new(Some(sent_tx)));
+    let send_fn: SendFn = {
+        let sent_tx = sent_tx.clone();
+        Arc::new(move |_data: Vec<u8>| {
+            let sent_tx = sent_tx.clone();
+            Box::pin(async move {
+                if let Some(tx) = sent_tx.lock().await.take() {
+                    let _ = tx.send(());
+                }
+                Ok(())
+            })
+        })
+    };
+
+    let channel = MuxChannel::new(send_fn);
+    let ch = channel.clone();
+
+    let call = tokio::spawn(async move {
+        let result: Result<EchoResponse, Error> = ch.unary(METHOD_ECHO, &EchoRequest { value: 42 }).await;
+        result
+    });
+
+    sent_rx.await.expect("request send should be observed");
+    channel.transport_closed().await;
+
+    let result = call.await.expect("join unary task");
+    assert!(matches!(result, Err(Error::Closed)));
+}
