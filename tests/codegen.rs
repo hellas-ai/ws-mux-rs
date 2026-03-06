@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use ws_mux::client::{MuxChannel, SendFn};
 use ws_mux::error::Error;
-use ws_mux::frame::Frame;
+use ws_mux::frame::{self, Frame, flags};
 use ws_mux::server::{StreamState, WsSink};
 
 // Include the generated code.
@@ -46,6 +46,12 @@ struct TestServiceImpl;
 
 impl test_service_mux::TestService for TestServiceImpl {
     async fn echo(&self, req: pb::EchoRequest) -> Result<pb::EchoResponse, Error> {
+        if req.value == 404 {
+            return Err(Error::Status {
+                code: ws_mux::error::code::NOT_FOUND,
+                message: "missing".into(),
+            });
+        }
         Ok(pb::EchoResponse { value: req.value })
     }
 
@@ -53,6 +59,12 @@ impl test_service_mux::TestService for TestServiceImpl {
         futures_util::stream::Iter<std::vec::IntoIter<Result<pb::CountResponse, Error>>>;
 
     async fn count_up(&self, req: pb::CountRequest) -> Result<Self::CountUpStream, Error> {
+        if req.count == 0 {
+            return Err(Error::Status {
+                code: ws_mux::error::code::UNAVAILABLE,
+                message: "empty stream".into(),
+            });
+        }
         let items: Vec<Result<pb::CountResponse, Error>> = (1..=req.count)
             .map(|i| Ok(pb::CountResponse { value: i }))
             .collect();
@@ -60,6 +72,12 @@ impl test_service_mux::TestService for TestServiceImpl {
     }
 
     async fn sum(&self, messages: Vec<pb::SumItem>) -> Result<pb::SumResponse, Error> {
+        if messages.is_empty() {
+            return Err(Error::Status {
+                code: ws_mux::error::code::INVALID_ARGUMENT,
+                message: "empty sum".into(),
+            });
+        }
         let total: u32 = messages.iter().map(|m| m.value).sum();
         Ok(pb::SumResponse { total })
     }
@@ -174,4 +192,118 @@ async fn codegen_client_streaming() {
 
     let resp: pb::SumResponse = resp_future.response().await.unwrap();
     assert_eq!(resp.total, 60);
+}
+
+#[tokio::test]
+async fn codegen_malformed_unary_request_returns_rst() {
+    let dispatcher = test_service_mux::TestServiceDispatcher::new(TestServiceImpl);
+    let (sink, mut rx, _, _) = ws_pair();
+    let mut streams = StreamState::default();
+
+    let frame = Frame {
+        stream_id: 1,
+        flags: flags::OPEN | flags::END,
+        payload: frame::build_open_payload(test_service_mux::METHOD_ECHO, &[0xff]),
+    };
+
+    ws_mux::server::handle_frame(&dispatcher, &frame.encode(), &sink, &mut streams)
+        .await
+        .expect("handle malformed unary frame");
+
+    let response = rx.recv().await.expect("rst response");
+    let rst = Frame::decode(&response).expect("valid rst frame");
+    let (code, _) = frame::parse_rst_payload(&rst.payload).expect("rst payload");
+
+    assert!(rst.is_rst());
+    assert_eq!(rst.stream_id, 1);
+    assert_eq!(code, ws_mux::error::code::INVALID_ARGUMENT);
+}
+
+#[tokio::test]
+async fn codegen_malformed_client_stream_request_returns_rst() {
+    let dispatcher = test_service_mux::TestServiceDispatcher::new(TestServiceImpl);
+    let (sink, mut rx, _, _) = ws_pair();
+    let mut streams = StreamState::default();
+
+    let open = Frame {
+        stream_id: 3,
+        flags: flags::OPEN,
+        payload: frame::build_open_payload(test_service_mux::METHOD_SUM, &[]),
+    };
+    ws_mux::server::handle_frame(&dispatcher, &open.encode(), &sink, &mut streams)
+        .await
+        .expect("handle open frame");
+
+    let end = Frame {
+        stream_id: 3,
+        flags: flags::DATA | flags::END,
+        payload: vec![0xff],
+    };
+    ws_mux::server::handle_frame(&dispatcher, &end.encode(), &sink, &mut streams)
+        .await
+        .expect("handle malformed client-stream frame");
+
+    let response = rx.recv().await.expect("rst response");
+    let rst = Frame::decode(&response).expect("valid rst frame");
+    let (code, _) = frame::parse_rst_payload(&rst.payload).expect("rst payload");
+
+    assert!(rst.is_rst());
+    assert_eq!(rst.stream_id, 3);
+    assert_eq!(code, ws_mux::error::code::INVALID_ARGUMENT);
+}
+
+#[tokio::test]
+async fn codegen_unary_status_is_preserved() {
+    let (client, _reader, _server) = setup();
+
+    let err = client
+        .echo(pb::EchoRequest { value: 404 })
+        .await
+        .expect_err("expected status error");
+
+    assert!(matches!(
+        err,
+        Error::Status { code, ref message }
+            if code == ws_mux::error::code::NOT_FOUND && message == "missing"
+    ));
+}
+
+#[tokio::test]
+async fn codegen_server_stream_status_is_preserved() {
+    let (client, _reader, _server) = setup();
+
+    let mut stream = client
+        .count_up(pb::CountRequest { count: 0 })
+        .await
+        .expect("open stream");
+
+    let err = stream
+        .message::<pb::CountResponse>()
+        .await
+        .expect_err("expected status error");
+
+    assert!(matches!(
+        err,
+        Error::Status { code, ref message }
+            if code == ws_mux::error::code::UNAVAILABLE && message == "empty stream"
+    ));
+}
+
+#[tokio::test]
+async fn codegen_client_stream_status_is_preserved() {
+    let (client, _reader, _server) = setup();
+
+    let (sender, resp_future) = client.sum().await.expect("open client stream");
+    sender.close().await.expect("close stream");
+
+    let err = resp_future
+        .response::<pb::SumResponse>()
+        .await
+        .expect_err("expected status error");
+
+    assert!(matches!(
+        err,
+        Error::Status { code, ref message }
+            if code == ws_mux::error::code::INVALID_ARGUMENT && message == "empty sum"
+    ));
 }

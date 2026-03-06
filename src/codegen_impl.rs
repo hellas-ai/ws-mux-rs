@@ -27,6 +27,7 @@ fn generate_service(service: &prost_build::Service) -> TokenStream {
     let method_constants = gen_method_constants(service);
     let method_names_array = gen_method_names(service);
     let server_trait = gen_server_trait(service);
+    let error_status_fn = gen_error_status_fn();
     let dispatch_fn = gen_dispatch(service);
     let dispatcher_struct = gen_dispatcher(service);
     let client_struct = gen_client(service);
@@ -45,6 +46,7 @@ fn generate_service(service: &prost_build::Service) -> TokenStream {
             #method_constants
             #method_names_array
             #server_trait
+            #error_status_fn
             #dispatch_fn
             #dispatcher_struct
             #client_struct
@@ -195,6 +197,17 @@ fn gen_trait_methods(service: &prost_build::Service, wasm: bool) -> TokenStream 
     quote! { #(#methods)* }
 }
 
+fn gen_error_status_fn() -> TokenStream {
+    quote! {
+        fn error_to_status(error: &ws_mux::Error) -> (u8, String) {
+            match error {
+                ws_mux::Error::Status { code, message } => (*code, message.clone()),
+                other => (ws_mux::error::code::INTERNAL, other.to_string()),
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn gen_dispatch(service: &prost_build::Service) -> TokenStream {
     let trait_name = format_ident!("{}", service.name);
@@ -210,8 +223,21 @@ fn gen_dispatch(service: &prost_build::Service) -> TokenStream {
             if method.server_streaming {
                 quote! {
                     #method_const => {
-                        let req = #req_type::decode(payload)
-                            .map_err(ws_mux::Error::from)?;
+                        let req = match #req_type::decode(payload) {
+                            Ok(req) => req,
+                            Err(e) => {
+                                let frame = ws_mux::Frame {
+                                    stream_id,
+                                    flags: ws_mux::flags::RST,
+                                    payload: ws_mux::frame::build_rst_payload(
+                                        ws_mux::error::code::INVALID_ARGUMENT,
+                                        &e.to_string(),
+                                    ),
+                                };
+                                sink.send_frame(frame).await?;
+                                return Ok(());
+                            }
+                        };
                         match service.#fn_name(req).await {
                             Ok(stream) => {
                                 use ::futures_core::Stream;
@@ -249,12 +275,13 @@ fn gen_dispatch(service: &prost_build::Service) -> TokenStream {
                                 sink.send_frame(frame).await?;
                             }
                             Err(e) => {
+                                let (code, message) = error_to_status(&e);
                                 let frame = ws_mux::Frame {
                                     stream_id,
                                     flags: ws_mux::flags::RST,
                                     payload: ws_mux::frame::build_rst_payload(
-                                        ws_mux::error::code::INTERNAL,
-                                        &e.to_string(),
+                                        code,
+                                        &message,
                                     ),
                                 };
                                 sink.send_frame(frame).await?;
@@ -268,8 +295,21 @@ fn gen_dispatch(service: &prost_build::Service) -> TokenStream {
                         let mut cursor = payload;
                         let mut messages = Vec::new();
                         while !cursor.is_empty() {
-                            let msg = #req_type::decode_length_delimited(&mut cursor)
-                                .map_err(ws_mux::Error::from)?;
+                            let msg = match #req_type::decode_length_delimited(&mut cursor) {
+                                Ok(msg) => msg,
+                                Err(e) => {
+                                    let frame = ws_mux::Frame {
+                                        stream_id,
+                                        flags: ws_mux::flags::RST,
+                                        payload: ws_mux::frame::build_rst_payload(
+                                            ws_mux::error::code::INVALID_ARGUMENT,
+                                            &e.to_string(),
+                                        ),
+                                    };
+                                    sink.send_frame(frame).await?;
+                                    return Ok(());
+                                }
+                            };
                             messages.push(msg);
                         }
                         match service.#fn_name(messages).await {
@@ -282,12 +322,13 @@ fn gen_dispatch(service: &prost_build::Service) -> TokenStream {
                                 sink.send_frame(frame).await?;
                             }
                             Err(e) => {
+                                let (code, message) = error_to_status(&e);
                                 let frame = ws_mux::Frame {
                                     stream_id,
                                     flags: ws_mux::flags::RST,
                                     payload: ws_mux::frame::build_rst_payload(
-                                        ws_mux::error::code::INTERNAL,
-                                        &e.to_string(),
+                                        code,
+                                        &message,
                                     ),
                                 };
                                 sink.send_frame(frame).await?;
@@ -298,8 +339,21 @@ fn gen_dispatch(service: &prost_build::Service) -> TokenStream {
             } else {
                 quote! {
                     #method_const => {
-                        let req = #req_type::decode(payload)
-                            .map_err(ws_mux::Error::from)?;
+                        let req = match #req_type::decode(payload) {
+                            Ok(req) => req,
+                            Err(e) => {
+                                let frame = ws_mux::Frame {
+                                    stream_id,
+                                    flags: ws_mux::flags::RST,
+                                    payload: ws_mux::frame::build_rst_payload(
+                                        ws_mux::error::code::INVALID_ARGUMENT,
+                                        &e.to_string(),
+                                    ),
+                                };
+                                sink.send_frame(frame).await?;
+                                return Ok(());
+                            }
+                        };
                         match service.#fn_name(req).await {
                             Ok(resp) => {
                                 let frame = ws_mux::Frame {
@@ -310,12 +364,13 @@ fn gen_dispatch(service: &prost_build::Service) -> TokenStream {
                                 sink.send_frame(frame).await?;
                             }
                             Err(e) => {
+                                let (code, message) = error_to_status(&e);
                                 let frame = ws_mux::Frame {
                                     stream_id,
                                     flags: ws_mux::flags::RST,
                                     payload: ws_mux::frame::build_rst_payload(
-                                        ws_mux::error::code::INTERNAL,
-                                        &e.to_string(),
+                                        code,
+                                        &message,
                                     ),
                                 };
                                 sink.send_frame(frame).await?;
