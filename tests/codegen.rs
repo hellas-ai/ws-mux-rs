@@ -52,6 +52,9 @@ impl test_service_mux::TestService for TestServiceImpl {
                 message: "missing".into(),
             });
         }
+        if req.value == 500 {
+            return Err(Error::Protocol("secret unary failure".into()));
+        }
         Ok(pb::EchoResponse { value: req.value })
     }
 
@@ -64,6 +67,11 @@ impl test_service_mux::TestService for TestServiceImpl {
                 code: ws_mux::error::code::UNAVAILABLE,
                 message: "empty stream".into(),
             });
+        }
+        if req.count == 999 {
+            return Ok(futures_util::stream::iter(vec![Err(Error::Protocol(
+                "secret stream failure".into(),
+            ))]));
         }
         let items: Vec<Result<pb::CountResponse, Error>> = (1..=req.count)
             .map(|i| Ok(pb::CountResponse { value: i }))
@@ -305,5 +313,42 @@ async fn codegen_client_stream_status_is_preserved() {
         err,
         Error::Status { code, ref message }
             if code == ws_mux::error::code::INVALID_ARGUMENT && message == "empty sum"
+    ));
+}
+
+#[tokio::test]
+async fn codegen_unary_internal_errors_are_sanitized() {
+    let (client, _reader, _server) = setup();
+
+    let err = client
+        .echo(pb::EchoRequest { value: 500 })
+        .await
+        .expect_err("expected internal error");
+
+    assert!(matches!(
+        err,
+        Error::Status { code, ref message }
+            if code == ws_mux::error::code::INTERNAL && message == "internal error"
+    ));
+}
+
+#[tokio::test]
+async fn codegen_stream_item_internal_errors_are_sanitized() {
+    let (client, _reader, _server) = setup();
+
+    let mut stream = client
+        .count_up(pb::CountRequest { count: 999 })
+        .await
+        .expect("open stream");
+
+    let err = stream
+        .message::<pb::CountResponse>()
+        .await
+        .expect_err("expected internal error");
+
+    assert!(matches!(
+        err,
+        Error::Status { code, ref message }
+            if code == ws_mux::error::code::INTERNAL && message == "internal error"
     ));
 }

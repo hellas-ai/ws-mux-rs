@@ -85,6 +85,9 @@ fn gen_method_names(service: &prost_build::Service) -> TokenStream {
     let count = names.len();
     quote! {
         /// Full gRPC-style method names, indexed by method constant.
+        ///
+        /// Method indices are positional, so both peers must be generated from
+        /// the same service definition and method ordering.
         pub const METHOD_NAMES: [&str; #count] = [#(#names),*];
     }
 }
@@ -202,7 +205,7 @@ fn gen_error_status_fn() -> TokenStream {
         fn error_to_status(error: &ws_mux::Error) -> (u8, String) {
             match error {
                 ws_mux::Error::Status { code, message } => (*code, message.clone()),
-                other => (ws_mux::error::code::INTERNAL, other.to_string()),
+                _ => (ws_mux::error::code::INTERNAL, "internal error".into()),
             }
         }
     }
@@ -253,12 +256,13 @@ fn gen_dispatch(service: &prost_build::Service) -> TokenStream {
                                             sink.send_frame(frame).await?;
                                         }
                                         Some(Err(e)) => {
+                                            let (code, message) = error_to_status(&e);
                                             let frame = ws_mux::Frame {
                                                 stream_id,
                                                 flags: ws_mux::flags::RST,
                                                 payload: ws_mux::frame::build_rst_payload(
-                                                    ws_mux::error::code::INTERNAL,
-                                                    &e.to_string(),
+                                                    code,
+                                                    &message,
                                                 ),
                                             };
                                             sink.send_frame(frame).await?;
