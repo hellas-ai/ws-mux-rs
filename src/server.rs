@@ -105,6 +105,10 @@ fn delimited_chunk_len(payload_len: usize) -> usize {
     varint_len(payload_len as u64).saturating_add(payload_len)
 }
 
+// Wall-clock time is used here because StreamState is serialized across
+// hibernation boundaries on wasm/DO-style deployments, where Instant is not
+// portable across suspend/resume. Clock shifts can delay pruning, but the
+// saturating subtraction prevents premature expiry.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -153,6 +157,7 @@ impl StreamState {
                 expired.push(stream_id);
             }
         }
+        expired.sort_unstable();
         for stream_id in &expired {
             let _ = self.remove_stream(*stream_id);
         }
@@ -296,9 +301,11 @@ async fn handle_decoded_frame<S: ServiceDispatch>(
                 return Ok(());
             }
 
-            if streams.total_active_payload_bytes.saturating_add(new_len)
-                > MAX_TOTAL_CLIENT_STREAM_PAYLOAD
-            {
+            // remove_stream() above already subtracted the old buffer from the
+            // aggregate total, so re-adding new_len checks the post-update
+            // aggregate size for this stream.
+            let total_after_reinsert = streams.total_active_payload_bytes.saturating_add(new_len);
+            if total_after_reinsert > MAX_TOTAL_CLIENT_STREAM_PAYLOAD {
                 let rst = Frame {
                     stream_id: frame.stream_id,
                     flags: flags::RST,
@@ -629,6 +636,34 @@ mod tests {
         let sent = sink.0.lock().await;
         assert!(sent.iter().any(|f| f.is_rst()));
         assert!(state.active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aggregate_cap_accounts_for_existing_stream_payload() {
+        let service = NoopService;
+        let sink = TestSink::default();
+        let mut state = StreamState::default();
+        state.active.insert(1, (0, vec![1; 8]));
+        state.last_activity_ms.insert(1, now_ms());
+        state.total_active_payload_bytes = MAX_TOTAL_CLIENT_STREAM_PAYLOAD - 1;
+
+        let frame = Frame {
+            stream_id: 1,
+            flags: flags::DATA,
+            payload: vec![42],
+        };
+        handle_frame(&service, &frame.encode(), &sink, &mut state)
+            .await
+            .expect("handle frame");
+
+        let sent = sink.0.lock().await;
+        assert!(sent.iter().any(|f| {
+            f.stream_id == 1
+                && f.is_rst()
+                && frame::parse_rst_payload(&f.payload)
+                    .map(|(code, _)| code == error::code::UNAVAILABLE)
+                    .unwrap_or(false)
+        }));
     }
 
     #[tokio::test]

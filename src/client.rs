@@ -101,15 +101,12 @@ impl MuxChannel {
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     tracing::warn!(stream_id, "response stream queue full, cancelling stream");
                     if self.deregister_stream(stream_id).await {
-                        let rst = Frame {
-                            stream_id,
-                            flags: flags::RST,
-                            payload: frame::build_rst_payload(
-                                error::code::CANCELLED,
-                                "response stream queue full",
-                            ),
-                        };
-                        let _ = self.send_raw(rst.encode()).await;
+                        let _ = self
+                            .send_raw(
+                                Self::cancellation_frame(stream_id, "response stream queue full")
+                                    .encode(),
+                            )
+                            .await;
                     }
                 }
             }
@@ -167,6 +164,37 @@ impl MuxChannel {
     /// Remove a stream from the dispatch table.
     async fn deregister_stream(&self, stream_id: u32) -> bool {
         self.inner.streams.lock().await.remove(&stream_id).is_some()
+    }
+
+    fn cancellation_frame(stream_id: u32, message: &'static str) -> Frame {
+        Frame {
+            stream_id,
+            flags: flags::RST,
+            payload: frame::build_rst_payload(error::code::CANCELLED, message),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn cleanup_stream_on_drop(&self, stream_id: u32, send_rst: bool) {
+        let channel = self.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if channel.deregister_stream(stream_id).await && send_rst {
+                    let _ = channel
+                        .send_raw(Self::cancellation_frame(stream_id, "cancelled").encode())
+                        .await;
+                }
+            });
+        } else if let Ok(mut streams) = self.inner.streams.try_lock() {
+            streams.remove(&stream_id);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn cleanup_stream_on_drop(&self, stream_id: u32, _send_rst: bool) {
+        if let Ok(mut streams) = self.inner.streams.try_lock() {
+            streams.remove(&stream_id);
+        }
     }
 
     /// Send raw bytes through the WebSocket sink.
@@ -386,6 +414,7 @@ async fn recv_unary_response<Resp: Message + Default>(
 }
 
 /// A stream of server-sent response messages for a server-streaming RPC.
+#[must_use = "dropping Streaming early cancels the RPC"]
 pub struct Streaming {
     channel: MuxChannel,
     stream_id: u32,
@@ -457,41 +486,13 @@ impl Streaming {
 
 impl Drop for Streaming {
     fn drop(&mut self) {
-        let channel = self.channel.clone();
-        let stream_id = self.stream_id;
-        #[cfg(not(target_arch = "wasm32"))]
-        let should_notify_server = !self.ended;
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    if channel.deregister_stream(stream_id).await && should_notify_server {
-                        // Notify the server we're no longer interested.
-                        let rst = Frame {
-                            stream_id,
-                            flags: flags::RST,
-                            payload: frame::build_rst_payload(error::code::CANCELLED, "cancelled"),
-                        };
-                        let _ = channel.send_raw(rst.encode()).await;
-                    }
-                });
-            } else if let Ok(mut streams) = channel.inner.streams.try_lock() {
-                streams.remove(&stream_id);
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            // Single-threaded: try_lock always succeeds outside an await point.
-            // No RST on wasm32 — send_raw requires async which we can't
-            // reliably do from Drop in all wasm contexts (CF Workers hibernation).
-            if let Ok(mut streams) = channel.inner.streams.try_lock() {
-                streams.remove(&stream_id);
-            }
-        }
+        self.channel
+            .cleanup_stream_on_drop(self.stream_id, !self.ended);
     }
 }
 
 /// Sender for a client-streaming RPC.
+#[must_use = "dropping StreamingSender early cancels the RPC"]
 pub struct StreamingSender {
     channel: MuxChannel,
     stream_id: u32,
@@ -528,39 +529,13 @@ impl Drop for StreamingSender {
     fn drop(&mut self) {
         if let Some(done) = self.done.take() {
             let _ = done.send(());
-            let channel = self.channel.clone();
-            let stream_id = self.stream_id;
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        if channel.deregister_stream(stream_id).await {
-                            let rst = Frame {
-                                stream_id,
-                                flags: flags::RST,
-                                payload: frame::build_rst_payload(
-                                    error::code::CANCELLED,
-                                    "cancelled",
-                                ),
-                            };
-                            let _ = channel.send_raw(rst.encode()).await;
-                        }
-                    });
-                } else if let Ok(mut streams) = channel.inner.streams.try_lock() {
-                    streams.remove(&stream_id);
-                }
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                if let Ok(mut streams) = channel.inner.streams.try_lock() {
-                    streams.remove(&stream_id);
-                }
-            }
+            self.channel.cleanup_stream_on_drop(self.stream_id, true);
         }
     }
 }
 
 /// Future that resolves to the single response of a client-streaming RPC.
+#[must_use = "dropping ResponseFuture early cancels the RPC"]
 pub struct ResponseFuture {
     channel: MuxChannel,
     stream_id: u32,
@@ -585,31 +560,7 @@ impl ResponseFuture {
 
 impl Drop for ResponseFuture {
     fn drop(&mut self) {
-        let channel = self.channel.clone();
-        let stream_id = self.stream_id;
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    if channel.deregister_stream(stream_id).await {
-                        let rst = Frame {
-                            stream_id,
-                            flags: flags::RST,
-                            payload: frame::build_rst_payload(error::code::CANCELLED, "cancelled"),
-                        };
-                        let _ = channel.send_raw(rst.encode()).await;
-                    }
-                });
-            } else if let Ok(mut streams) = channel.inner.streams.try_lock() {
-                streams.remove(&stream_id);
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            if let Ok(mut streams) = channel.inner.streams.try_lock() {
-                streams.remove(&stream_id);
-            }
-        }
+        self.channel.cleanup_stream_on_drop(self.stream_id, true);
     }
 }
 
@@ -727,6 +678,40 @@ mod tests {
         let (sender, resp) = channel.client_streaming(2).await.expect("open stream");
         sender.close().await.expect("close stream");
         drop(resp);
+
+        for _ in 0..100 {
+            if sent.lock().await.iter().any(Frame::is_rst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(sent.lock().await.iter().any(Frame::is_rst));
+    }
+
+    #[tokio::test]
+    async fn dropping_streaming_sends_rst() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let send_fn: SendFn = {
+            let sent = sent.clone();
+            Arc::new(move |data: Vec<u8>| {
+                let sent = sent.clone();
+                Box::pin(async move {
+                    sent.lock().await.push(Frame::decode(&data)?);
+                    Ok(())
+                })
+            })
+        };
+        let channel = MuxChannel::new(send_fn);
+        let (stream_id, rx) = channel.alloc_and_register_stream().await.expect("register stream");
+
+        let stream = Streaming {
+            channel: channel.clone(),
+            stream_id,
+            rx,
+            ended: false,
+        };
+        drop(stream);
 
         for _ in 0..100 {
             if sent.lock().await.iter().any(Frame::is_rst) {

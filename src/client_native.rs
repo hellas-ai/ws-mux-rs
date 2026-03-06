@@ -32,7 +32,7 @@ impl MuxChannel {
                     .await
                     .send(msg)
                     .await
-                    .map_err(|e| Error::Connect(e.to_string()))
+                    .map_err(|e| Error::Send(e.to_string()))
             })
         });
 

@@ -25,6 +25,8 @@ pub struct Frame {
 impl Frame {
     /// Size of the fixed header (stream_id + flags).
     pub const HEADER_LEN: usize = 5;
+    /// Maximum payload size for a single frame.
+    pub const MAX_PAYLOAD_LEN: usize = 4 * 1024 * 1024;
 
     /// Encode the frame into a byte vector suitable for a WebSocket binary message.
     pub fn encode(&self) -> Vec<u8> {
@@ -39,6 +41,13 @@ impl Frame {
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
         if data.len() < Self::HEADER_LEN {
             return Err(Error::FrameTooShort(data.len()));
+        }
+        let payload_len = data.len() - Self::HEADER_LEN;
+        if payload_len > Self::MAX_PAYLOAD_LEN {
+            return Err(Error::FrameTooLarge {
+                len: payload_len,
+                max: Self::MAX_PAYLOAD_LEN,
+            });
         }
         let stream_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let flags = data[4];
@@ -136,6 +145,20 @@ mod tests {
     fn frame_too_short() {
         assert!(Frame::decode(&[0, 1, 2, 3]).is_err());
         assert!(Frame::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn frame_too_large() {
+        let mut data = vec![0; Frame::HEADER_LEN + Frame::MAX_PAYLOAD_LEN + 1];
+        data[4] = flags::DATA;
+        let err = Frame::decode(&data).expect_err("oversized frame should be rejected");
+        assert!(matches!(
+            err,
+            Error::FrameTooLarge {
+                len,
+                max: Frame::MAX_PAYLOAD_LEN,
+            } if len == Frame::MAX_PAYLOAD_LEN + 1
+        ));
     }
 
     #[test]

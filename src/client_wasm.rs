@@ -81,7 +81,7 @@ impl MuxChannel {
             Box::pin(async move {
                 let arr = Uint8Array::from(data.as_slice());
                 ws.send_with_array_buffer(&arr.buffer())
-                    .map_err(|e| Error::Connect(format!("ws send: {e:?}")))?;
+                    .map_err(|e| Error::Send(format!("ws send: {e:?}")))?;
                 Ok(())
             })
         });

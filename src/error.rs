@@ -15,6 +15,9 @@ pub enum Error {
     #[error("frame too short: {0} bytes")]
     FrameTooShort(usize),
 
+    #[error("frame payload too large: {len} bytes exceeds max {max}")]
+    FrameTooLarge { len: usize, max: usize },
+
     #[error("protocol error: {0}")]
     Protocol(String),
 
@@ -35,4 +38,7 @@ pub enum Error {
 
     #[error("connect: {0}")]
     Connect(String),
+
+    #[error("send: {0}")]
+    Send(String),
 }
