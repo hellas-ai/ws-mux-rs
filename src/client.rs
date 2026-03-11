@@ -111,10 +111,7 @@ impl MuxChannel {
                 }
             }
         } else {
-            tracing::debug!(
-                stream_id,
-                "no receiver for frame, dropping"
-            );
+            tracing::debug!(stream_id, "no receiver for frame, dropping");
         }
     }
 
@@ -443,10 +440,7 @@ impl Streaming {
                 let (code, msg) = frame::parse_rst_payload(&frame.payload)?;
                 let message = msg.to_owned();
                 self.finish().await;
-                return Err(Error::Status {
-                    code,
-                    message,
-                });
+                return Err(Error::Status { code, message });
             }
 
             if frame.is_open() {
@@ -703,7 +697,10 @@ mod tests {
             })
         };
         let channel = MuxChannel::new(send_fn);
-        let (stream_id, rx) = channel.alloc_and_register_stream().await.expect("register stream");
+        let (stream_id, rx) = channel
+            .alloc_and_register_stream()
+            .await
+            .expect("register stream");
 
         let stream = Streaming {
             channel: channel.clone(),
@@ -767,7 +764,10 @@ mod tests {
     async fn streaming_end_deregisters_stream_immediately() {
         let send_fn: SendFn = Arc::new(|_data: Vec<u8>| Box::pin(async { Ok(()) }));
         let channel = MuxChannel::new(send_fn);
-        let (stream_id, rx) = channel.alloc_and_register_stream().await.expect("register stream");
+        let (stream_id, rx) = channel
+            .alloc_and_register_stream()
+            .await
+            .expect("register stream");
 
         let tx = channel
             .inner
@@ -875,12 +875,21 @@ mod tests {
         let fast_msg = TestMsg::decode(fast_frame.payload.as_slice()).expect("decode fast message");
 
         assert_eq!(fast_msg.value, 7);
-        assert!(!channel.inner.streams.lock().await.contains_key(&slow_stream_id));
+        assert!(
+            !channel
+                .inner
+                .streams
+                .lock()
+                .await
+                .contains_key(&slow_stream_id)
+        );
         assert!(sent.lock().await.iter().any(|frame| {
             frame.stream_id == slow_stream_id
                 && frame.is_rst()
                 && frame::parse_rst_payload(&frame.payload)
-                    .map(|(code, msg)| code == error::code::CANCELLED && msg == "response stream queue full")
+                    .map(|(code, msg)| {
+                        code == error::code::CANCELLED && msg == "response stream queue full"
+                    })
                     .unwrap_or(false)
         }));
     }

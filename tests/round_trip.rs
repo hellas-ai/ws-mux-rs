@@ -501,7 +501,8 @@ async fn transport_closed_wakes_pending_unary_for_custom_transports() {
     let ch = channel.clone();
 
     let call = tokio::spawn(async move {
-        let result: Result<EchoResponse, Error> = ch.unary(METHOD_ECHO, &EchoRequest { value: 42 }).await;
+        let result: Result<EchoResponse, Error> =
+            ch.unary(METHOD_ECHO, &EchoRequest { value: 42 }).await;
         result
     });
 

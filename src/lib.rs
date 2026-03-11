@@ -25,17 +25,18 @@ pub use frame::{Frame, flags};
 pub use client::{MuxChannel, ResponseFuture, SendFn, Streaming, StreamingSender};
 
 #[cfg(feature = "server")]
-pub use server::{ServerSink, ServiceDispatch, StreamState, WsSink, handle_frame};
+mod server_exports {
+    pub use crate::server::{ServerSink, ServiceDispatch, StreamState, WsSink, handle_frame};
 
-#[cfg(all(feature = "client", feature = "server"))]
-pub use server::handle_bidi_frame;
+    #[cfg(feature = "client")]
+    pub use crate::server::handle_bidi_frame;
 
-#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
-pub use server::{WsRecv, serve};
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use crate::server::{WsRecv, serve};
 
-#[cfg(all(
-    feature = "native-client",
-    feature = "server",
-    not(target_arch = "wasm32")
-))]
-pub use server::{NativeWsRecv, NativeWsSink};
+    #[cfg(all(feature = "native-client", not(target_arch = "wasm32")))]
+    pub use crate::server::{NativeWsRecv, NativeWsSink};
+}
+
+#[cfg(feature = "server")]
+pub use server_exports::*;
