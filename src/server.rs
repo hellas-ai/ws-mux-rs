@@ -505,6 +505,67 @@ impl<S> NativeWsSink<S> {
 }
 
 #[cfg(all(feature = "native-client", not(target_arch = "wasm32")))]
+impl<S> NativeWsSink<S>
+where
+    S: futures_util::Sink<
+            tokio_tungstenite::tungstenite::Message,
+            Error = tokio_tungstenite::tungstenite::Error,
+        > + Unpin
+        + Send
+        + Sync
+        + 'static,
+{
+    async fn send_message(
+        &self,
+        message: tokio_tungstenite::tungstenite::Message,
+    ) -> Result<(), Error> {
+        use futures_util::SinkExt;
+
+        self.write
+            .lock()
+            .await
+            .send(message)
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(e)))
+    }
+
+    /// Send a WebSocket ping control frame.
+    pub async fn ping(&self, payload: Vec<u8>) -> Result<(), Error> {
+        self.send_message(tokio_tungstenite::tungstenite::Message::Ping(
+            payload.into(),
+        ))
+        .await
+    }
+
+    /// Spawn a detached task that sends periodic empty ping frames.
+    pub fn spawn_keepalive(
+        &self,
+        interval: std::time::Duration,
+    ) -> Result<tokio::task::JoinHandle<()>, Error> {
+        if interval.is_zero() {
+            return Err(Error::Protocol(
+                "keepalive interval must be greater than zero".into(),
+            ));
+        }
+
+        let sink = self.clone();
+        Ok(tokio::spawn(async move {
+            let mut ticks =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                ticks.tick().await;
+                if let Err(e) = sink.ping(Vec::new()).await {
+                    tracing::debug!(error = %e, "ws keepalive ping failed");
+                    break;
+                }
+            }
+        }))
+    }
+}
+
+#[cfg(all(feature = "native-client", not(target_arch = "wasm32")))]
 impl<S> WsSink for NativeWsSink<S>
 where
     S: futures_util::Sink<
@@ -516,14 +577,8 @@ where
         + 'static,
 {
     async fn send(&self, data: Vec<u8>) -> Result<(), Error> {
-        use futures_util::SinkExt;
-
-        self.write
-            .lock()
+        self.send_message(tokio_tungstenite::tungstenite::Message::Binary(data.into()))
             .await
-            .send(tokio_tungstenite::tungstenite::Message::Binary(data.into()))
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(e)))
     }
 }
 
@@ -563,7 +618,15 @@ where
                 Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
                     return Ok(None);
                 }
-                Some(Ok(_)) => continue, // ignore text, ping, pong
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => {
+                    tracing::trace!(bytes = payload.len(), "received ws ping");
+                    continue;
+                }
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(payload))) => {
+                    tracing::trace!(bytes = payload.len(), "received ws pong");
+                    continue;
+                }
+                Some(Ok(_)) => continue,
                 Some(Err(e)) => return Err(Error::Io(std::io::Error::other(e))),
             }
         }
@@ -574,6 +637,11 @@ where
 mod tests {
     use super::*;
     use std::sync::Arc;
+    #[cfg(feature = "native-client")]
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
     use tokio::sync::Mutex;
 
     #[derive(Clone, Default)]
@@ -685,5 +753,89 @@ mod tests {
         let sent = sink.0.lock().await;
         assert!(sent.iter().any(|f| f.stream_id == 1 && f.is_rst()));
         assert!(!state.active.contains_key(&1));
+    }
+
+    #[cfg(feature = "native-client")]
+    #[derive(Clone, Default)]
+    struct RecordingMessageSink {
+        sent: Arc<std::sync::Mutex<Vec<tokio_tungstenite::tungstenite::Message>>>,
+    }
+
+    #[cfg(feature = "native-client")]
+    impl futures_util::Sink<tokio_tungstenite::tungstenite::Message> for RecordingMessageSink {
+        type Error = tokio_tungstenite::tungstenite::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            item: tokio_tungstenite::tungstenite::Message,
+        ) -> Result<(), Self::Error> {
+            self.get_mut()
+                .sent
+                .lock()
+                .expect("recording sink lock")
+                .push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(feature = "native-client")]
+    #[test]
+    fn native_ws_sink_keepalive_rejects_zero_interval() {
+        let sink = NativeWsSink::new(RecordingMessageSink::default());
+        let err = sink
+            .spawn_keepalive(std::time::Duration::ZERO)
+            .err()
+            .expect("zero keepalive interval should fail");
+        assert!(matches!(err, Error::Protocol(message) if message.contains("keepalive interval")));
+    }
+
+    #[cfg(feature = "native-client")]
+    #[tokio::test(start_paused = true)]
+    async fn native_ws_sink_keepalive_sends_ping_frames() {
+        let recorder = RecordingMessageSink::default();
+        let sink = NativeWsSink::new(recorder.clone());
+        let _keepalive = sink
+            .spawn_keepalive(std::time::Duration::from_secs(10))
+            .expect("spawn keepalive");
+
+        tokio::task::yield_now().await;
+        assert!(
+            recorder
+                .sent
+                .lock()
+                .expect("recording sink lock")
+                .is_empty()
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+
+        let sent = recorder.sent.lock().expect("recording sink lock");
+        assert_eq!(sent.len(), 1);
+        assert!(matches!(
+            &sent[0],
+            tokio_tungstenite::tungstenite::Message::Ping(payload) if payload.is_empty()
+        ));
     }
 }
