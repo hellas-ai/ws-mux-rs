@@ -1,6 +1,6 @@
 [package]
 name = "ws-mux"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "Lightweight multiplexed RPC over WebSockets with protobuf framing"
 license = "MIT"
@@ -13,13 +13,16 @@ server = ["dep:tokio"]
 native-client = ["client", "dep:futures-util", "dep:tokio-tungstenite"]
 wasm-client = ["client", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
 codegen = ["dep:prost-build", "dep:proc-macro2", "dep:quote"]
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 compile = ["client", "server", "native-client"]
 
 [dependencies]
 futures-core = "0.3"
 prost = "0.14"
 thiserror = "2"
-tracing = "0.1"
+tracing = { version = "0.1", features = ["attributes"] }
+opentelemetry = { version = "0.31", optional = true, default-features = false, features = ["trace"] }
+tracing-opentelemetry = { version = "0.32", optional = true, default-features = false }
 tokio = { version = "1", optional = true, features = ["sync", "rt", "time"] }
 prost-build = { version = "0.14", optional = true }
 proc-macro2 = { version = "1", optional = true }

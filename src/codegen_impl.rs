@@ -396,23 +396,41 @@ fn gen_dispatch(service: &prost_build::Service) -> TokenStream {
             method_index: u8,
             payload: &[u8],
             sink: &dyn ws_mux::ServerSink,
+            trace_ctx: &ws_mux::TraceContext,
         ) -> Result<(), ws_mux::Error> {
             use ::prost::Message;
-            match method_index {
-                #(#arms)*
-                _ => {
-                    let frame = ws_mux::Frame {
-                        stream_id,
-                        flags: ws_mux::flags::RST,
-                        payload: ws_mux::frame::build_rst_payload(
-                            ws_mux::error::code::UNIMPLEMENTED,
-                            "unknown method",
-                        ),
-                    };
-                    sink.send_frame(frame).await?;
+            use ::tracing::Instrument;
+
+            let method_name = METHOD_NAMES
+                .get(method_index as usize)
+                .copied()
+                .unwrap_or("unknown");
+            let span = ::tracing::info_span!(
+                "ws_mux.dispatch",
+                stream_id,
+                rpc.method = method_name,
+            );
+            trace_ctx.set_span_parent(&span);
+
+            async {
+                match method_index {
+                    #(#arms)*
+                    _ => {
+                        let frame = ws_mux::Frame {
+                            stream_id,
+                            flags: ws_mux::flags::RST,
+                            payload: ws_mux::frame::build_rst_payload(
+                                ws_mux::error::code::UNIMPLEMENTED,
+                                "unknown method",
+                            ),
+                        };
+                        sink.send_frame(frame).await?;
+                    }
                 }
+                Ok(())
             }
-            Ok(())
+            .instrument(span)
+            .await
         }
     }
 }
@@ -445,8 +463,9 @@ fn gen_dispatcher(service: &prost_build::Service) -> TokenStream {
                 method_index: u8,
                 payload: &[u8],
                 sink: &dyn ws_mux::ServerSink,
+                trace_ctx: &ws_mux::TraceContext,
             ) -> Result<(), ws_mux::Error> {
-                dispatch(&self.service, stream_id, method_index, payload, sink).await
+                dispatch(&self.service, stream_id, method_index, payload, sink, trace_ctx).await
             }
         }
     }
