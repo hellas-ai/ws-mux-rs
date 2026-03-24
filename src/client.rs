@@ -683,6 +683,7 @@ mod tests {
     use super::*;
     use prost::Message;
     use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     #[derive(Clone, PartialEq, Message)]
     struct TestMsg {
