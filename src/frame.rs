@@ -5,7 +5,7 @@ use crate::error::Error;
 /// Carries the caller's trace identity for distributed tracing.
 /// When the `otel` feature is enabled, this is populated from the current
 /// OpenTelemetry context. All-zero `trace_id` means no active trace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TraceContext {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
@@ -31,7 +31,9 @@ impl TraceContext {
     /// Decode from the start of `data`. Returns the context and remaining bytes.
     pub fn decode(data: &[u8]) -> Result<(Self, &[u8]), Error> {
         if data.len() < Self::SIZE {
-            return Err(Error::Protocol("trace context too short in OPEN payload".into()));
+            return Err(Error::Protocol(
+                "trace context too short in OPEN payload".into(),
+            ));
         }
         let mut trace_id = [0u8; 16];
         trace_id.copy_from_slice(&data[..16]);
@@ -71,16 +73,6 @@ impl TraceContext {
         #[cfg(feature = "otel")]
         if self.is_valid() {
             crate::otel::set_span_parent(self, _span);
-        }
-    }
-}
-
-impl Default for TraceContext {
-    fn default() -> Self {
-        Self {
-            trace_id: [0; 16],
-            span_id: [0; 8],
-            trace_flags: 0,
         }
     }
 }

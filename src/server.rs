@@ -457,14 +457,14 @@ where
 
         if frame.is_open() && frame.is_end() {
             // Unary or server-streaming request — can be dispatched concurrently.
-            let (method_index, trace_ctx, payload) =
-                match frame::parse_open_payload(&frame.payload) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "bad OPEN payload");
-                        continue;
-                    }
-                };
+            let (method_index, trace_ctx, payload) = match frame::parse_open_payload(&frame.payload)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "bad OPEN payload");
+                    continue;
+                }
+            };
             let payload = payload.to_vec();
             tokio::spawn(async move {
                 if let Err(e) = service

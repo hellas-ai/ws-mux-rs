@@ -284,8 +284,7 @@ impl MuxChannel {
 
             // Send OPEN|END with method index + trace context + encoded request.
             let trace_ctx = TraceContext::current();
-            let payload =
-                frame::build_open_payload(method, &trace_ctx, &req.encode_to_vec());
+            let payload = frame::build_open_payload(method, &trace_ctx, &req.encode_to_vec());
             let frame = Frame {
                 stream_id,
                 flags: flags::OPEN | flags::END,
@@ -326,8 +325,7 @@ impl MuxChannel {
 
             // Send OPEN|END with method index + trace context + encoded request.
             let trace_ctx = TraceContext::current();
-            let payload =
-                frame::build_open_payload(method, &trace_ctx, &req.encode_to_vec());
+            let payload = frame::build_open_payload(method, &trace_ctx, &req.encode_to_vec());
             let frame = Frame {
                 stream_id,
                 flags: flags::OPEN | flags::END,

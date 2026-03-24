@@ -226,11 +226,11 @@ async fn run_server(
 
         if frame.is_open() && frame.is_end() {
             // Unary / server-streaming — dispatch in a separate task.
-            let (method_index, trace_ctx, payload) =
-                match frame::parse_open_payload(&frame.payload) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
+            let (method_index, trace_ctx, payload) = match frame::parse_open_payload(&frame.payload)
+            {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
             let payload = payload.to_vec();
             tokio::spawn(async move {
                 let _ = service
