@@ -5,6 +5,7 @@ use futures_util::SinkExt;
 use futures_util::stream::StreamExt;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite;
+use tracing::Instrument;
 
 use crate::client::{MuxChannel, SendFn};
 use crate::error::Error;
@@ -46,6 +47,7 @@ impl MuxChannel {
         }
 
         let (ws_stream, _) = tokio_tungstenite::connect_async(url)
+            .instrument(tracing::info_span!("ws_mux.connect", url))
             .await
             .map_err(|e| Error::Connect(e.to_string()))?;
 

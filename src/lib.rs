@@ -1,6 +1,9 @@
 pub mod error;
 pub mod frame;
 
+#[cfg(feature = "otel")]
+mod otel;
+
 #[cfg(feature = "codegen")]
 pub mod codegen {
     include!("codegen_impl.rs");
@@ -19,7 +22,7 @@ mod client_wasm;
 pub mod server;
 
 pub use error::Error;
-pub use frame::{Frame, flags};
+pub use frame::{Frame, TraceContext, flags};
 
 #[cfg(feature = "client")]
 pub use client::{MuxChannel, ResponseFuture, SendFn, Streaming, StreamingSender};

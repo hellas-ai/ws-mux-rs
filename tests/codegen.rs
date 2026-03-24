@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use ws_mux::client::{MuxChannel, SendFn};
 use ws_mux::error::Error;
-use ws_mux::frame::{self, Frame, flags};
+use ws_mux::frame::{self, Frame, TraceContext, flags};
 use ws_mux::server::{StreamState, WsSink};
 
 // Include the generated code.
@@ -211,7 +211,11 @@ async fn codegen_malformed_unary_request_returns_rst() {
     let frame = Frame {
         stream_id: 1,
         flags: flags::OPEN | flags::END,
-        payload: frame::build_open_payload(test_service_mux::METHOD_ECHO, &[0xff]),
+        payload: frame::build_open_payload(
+            test_service_mux::METHOD_ECHO,
+            &TraceContext::default(),
+            &[0xff],
+        ),
     };
 
     ws_mux::server::handle_frame(&dispatcher, &frame.encode(), &sink, &mut streams)
@@ -236,7 +240,11 @@ async fn codegen_malformed_client_stream_request_returns_rst() {
     let open = Frame {
         stream_id: 3,
         flags: flags::OPEN,
-        payload: frame::build_open_payload(test_service_mux::METHOD_SUM, &[]),
+        payload: frame::build_open_payload(
+            test_service_mux::METHOD_SUM,
+            &TraceContext::default(),
+            &[],
+        ),
     };
     ws_mux::server::handle_frame(&dispatcher, &open.encode(), &sink, &mut streams)
         .await

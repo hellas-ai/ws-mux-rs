@@ -1,5 +1,5 @@
 use crate::error::{self, Error};
-use crate::frame::{self, Frame, flags};
+use crate::frame::{self, Frame, TraceContext, flags};
 
 /// Trait for sending raw bytes over a WebSocket (server-side).
 #[cfg(not(target_arch = "wasm32"))]
@@ -25,6 +25,7 @@ pub trait ServiceDispatch: Send + Sync + 'static {
         method_index: u8,
         payload: &[u8],
         sink: &dyn ServerSink,
+        trace_ctx: &TraceContext,
     ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 }
 
@@ -37,6 +38,7 @@ pub trait ServiceDispatch: 'static {
         method_index: u8,
         payload: &[u8],
         sink: &dyn ServerSink,
+        trace_ctx: &TraceContext,
     ) -> impl std::future::Future<Output = Result<(), Error>>;
 }
 
@@ -122,8 +124,8 @@ fn now_ms() -> u64 {
 /// This state is serializable for DO hibernation.
 #[derive(Default, Debug, Clone)]
 pub struct StreamState {
-    /// Active client-streaming streams: stream_id -> (method_index, accumulated payload bytes).
-    pub active: std::collections::HashMap<u32, (u8, Vec<u8>)>,
+    /// Active client-streaming streams: stream_id -> (method_index, trace_context, accumulated payload bytes).
+    pub active: std::collections::HashMap<u32, (u8, TraceContext, Vec<u8>)>,
     /// Last observed activity timestamp per stream (`unix_ms`).
     pub last_activity_ms: std::collections::HashMap<u32, u64>,
     /// Total buffered bytes across all active client streams.
@@ -131,17 +133,25 @@ pub struct StreamState {
 }
 
 impl StreamState {
-    fn insert_stream(&mut self, stream_id: u32, method_index: u8, payload: Vec<u8>, now_ms: u64) {
+    fn insert_stream(
+        &mut self,
+        stream_id: u32,
+        method_index: u8,
+        trace_ctx: TraceContext,
+        payload: Vec<u8>,
+        now_ms: u64,
+    ) {
         self.total_active_payload_bytes = self
             .total_active_payload_bytes
             .saturating_add(payload.len());
-        self.active.insert(stream_id, (method_index, payload));
+        self.active
+            .insert(stream_id, (method_index, trace_ctx, payload));
         self.last_activity_ms.insert(stream_id, now_ms);
     }
 
-    fn remove_stream(&mut self, stream_id: u32) -> Option<(u8, Vec<u8>)> {
+    fn remove_stream(&mut self, stream_id: u32) -> Option<(u8, TraceContext, Vec<u8>)> {
         let removed = self.active.remove(&stream_id);
-        if let Some((_, payload)) = &removed {
+        if let Some((_, _, payload)) = &removed {
             self.total_active_payload_bytes = self
                 .total_active_payload_bytes
                 .saturating_sub(payload.len());
@@ -192,12 +202,12 @@ async fn handle_decoded_frame<S: ServiceDispatch>(
     }
 
     if frame.is_open() {
-        let (method_index, payload) = frame::parse_open_payload(&frame.payload)?;
+        let (method_index, trace_ctx, payload) = frame::parse_open_payload(&frame.payload)?;
 
         if frame.is_end() {
             // Unary or server-streaming: OPEN|END — dispatch immediately.
             service
-                .dispatch(frame.stream_id, method_index, payload, sink)
+                .dispatch(frame.stream_id, method_index, payload, sink, &trace_ctx)
                 .await?;
         } else {
             // Client-streaming: OPEN without END — start accumulating.
@@ -265,24 +275,24 @@ async fn handle_decoded_frame<S: ServiceDispatch>(
                 prost::encoding::encode_varint(payload.len() as u64, &mut buf);
                 buf.extend_from_slice(payload);
             }
-            streams.insert_stream(frame.stream_id, method_index, buf, now);
+            streams.insert_stream(frame.stream_id, method_index, trace_ctx, buf, now);
         }
         return Ok(());
     }
 
     if frame.is_data() {
-        if let Some((method_index, mut buf)) = streams.remove_stream(frame.stream_id) {
+        if let Some((method_index, trace_ctx, mut buf)) = streams.remove_stream(frame.stream_id) {
             if frame.is_end() && frame.payload.is_empty() {
                 // DATA|END with empty payload is an end marker, not an extra empty message.
                 service
-                    .dispatch(frame.stream_id, method_index, &buf, sink)
+                    .dispatch(frame.stream_id, method_index, &buf, sink, &trace_ctx)
                     .await?;
                 return Ok(());
             }
 
             if frame.payload.is_empty() {
                 // Ignore empty DATA chunks that are not terminators.
-                streams.insert_stream(frame.stream_id, method_index, buf, now);
+                streams.insert_stream(frame.stream_id, method_index, trace_ctx, buf, now);
                 return Ok(());
             }
 
@@ -325,12 +335,12 @@ async fn handle_decoded_frame<S: ServiceDispatch>(
 
             if frame.is_end() {
                 service
-                    .dispatch(frame.stream_id, method_index, &buf, sink)
+                    .dispatch(frame.stream_id, method_index, &buf, sink, &trace_ctx)
                     .await?;
                 return Ok(());
             }
 
-            streams.insert_stream(frame.stream_id, method_index, buf, now);
+            streams.insert_stream(frame.stream_id, method_index, trace_ctx, buf, now);
             return Ok(());
         }
 
@@ -447,17 +457,18 @@ where
 
         if frame.is_open() && frame.is_end() {
             // Unary or server-streaming request — can be dispatched concurrently.
-            let (method_index, payload) = match frame::parse_open_payload(&frame.payload) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "bad OPEN payload");
-                    continue;
-                }
-            };
+            let (method_index, trace_ctx, payload) =
+                match frame::parse_open_payload(&frame.payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "bad OPEN payload");
+                        continue;
+                    }
+                };
             let payload = payload.to_vec();
             tokio::spawn(async move {
                 if let Err(e) = service
-                    .dispatch(frame.stream_id, method_index, &payload, &sink)
+                    .dispatch(frame.stream_id, method_index, &payload, &sink, &trace_ctx)
                     .await
                 {
                     tracing::warn!(error = %e, stream_id = frame.stream_id, "dispatch error");
@@ -654,6 +665,7 @@ mod tests {
             _method_index: u8,
             _payload: &[u8],
             _sink: &dyn ServerSink,
+            _trace_ctx: &TraceContext,
         ) -> Result<(), Error> {
             Ok(())
         }
@@ -673,8 +685,9 @@ mod tests {
     #[test]
     fn prune_idle_streams_reclaims_payload_bytes() {
         let mut state = StreamState::default();
-        state.insert_stream(1, 0, vec![0; 10], 100);
-        state.insert_stream(3, 0, vec![0; 20], 200);
+        let tc = TraceContext::default();
+        state.insert_stream(1, 0, tc, vec![0; 10], 100);
+        state.insert_stream(3, 0, tc, vec![0; 20], 200);
 
         let expired = state.prune_idle_streams(100 + CLIENT_STREAM_IDLE_TIMEOUT_MS + 1);
         assert_eq!(expired, vec![1]);
@@ -695,7 +708,7 @@ mod tests {
         let frame = Frame {
             stream_id: 1,
             flags: flags::OPEN,
-            payload: frame::build_open_payload(0, &[42]),
+            payload: frame::build_open_payload(0, &TraceContext::default(), &[42]),
         };
         handle_frame(&service, &frame.encode(), &sink, &mut state)
             .await
@@ -711,7 +724,9 @@ mod tests {
         let service = NoopService;
         let sink = TestSink::default();
         let mut state = StreamState::default();
-        state.active.insert(1, (0, vec![1; 8]));
+        state
+            .active
+            .insert(1, (0, TraceContext::default(), vec![1; 8]));
         state.last_activity_ms.insert(1, now_ms());
         state.total_active_payload_bytes = MAX_TOTAL_CLIENT_STREAM_PAYLOAD - 1;
 
@@ -739,12 +754,12 @@ mod tests {
         let service = NoopService;
         let sink = TestSink::default();
         let mut state = StreamState::default();
-        state.insert_stream(1, 0, vec![7], 0);
+        state.insert_stream(1, 0, TraceContext::default(), vec![7], 0);
 
         let frame = Frame {
             stream_id: 9,
             flags: flags::OPEN | flags::END,
-            payload: frame::build_open_payload(0, &[]),
+            payload: frame::build_open_payload(0, &TraceContext::default(), &[]),
         };
         handle_frame(&service, &frame.encode(), &sink, &mut state)
             .await

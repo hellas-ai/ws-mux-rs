@@ -6,7 +6,7 @@ use prost::Message;
 use tokio::sync::mpsc;
 use ws_mux::client::{MuxChannel, SendFn};
 use ws_mux::error::{self, Error};
-use ws_mux::frame::{self, Frame, flags};
+use ws_mux::frame::{self, Frame, TraceContext, flags};
 use ws_mux::server::{
     ServerSink, ServiceDispatch, StreamState, WsSink, handle_bidi_frame, handle_frame,
 };
@@ -126,6 +126,7 @@ impl ServiceDispatch for TestService {
         method_index: u8,
         payload: &[u8],
         sink: &dyn ServerSink,
+        _trace_ctx: &TraceContext,
     ) -> Result<(), Error> {
         match method_index {
             METHOD_ECHO => {
@@ -225,14 +226,15 @@ async fn run_server(
 
         if frame.is_open() && frame.is_end() {
             // Unary / server-streaming — dispatch in a separate task.
-            let (method_index, payload) = match frame::parse_open_payload(&frame.payload) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let (method_index, trace_ctx, payload) =
+                match frame::parse_open_payload(&frame.payload) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
             let payload = payload.to_vec();
             tokio::spawn(async move {
                 let _ = service
-                    .dispatch(frame.stream_id, method_index, &payload, &sink)
+                    .dispatch(frame.stream_id, method_index, &payload, &sink, &trace_ctx)
                     .await;
             });
         } else {
@@ -442,7 +444,7 @@ async fn bidi_routes_remote_client_streaming_frames() {
     let open = Frame {
         stream_id: 1,
         flags: flags::OPEN,
-        payload: frame::build_open_payload(METHOD_COUNT_ITEMS, &[]),
+        payload: frame::build_open_payload(METHOD_COUNT_ITEMS, &TraceContext::default(), &[]),
     };
     WsSink::send(&b_sink, open.encode()).await.unwrap();
 

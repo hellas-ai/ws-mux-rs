@@ -8,10 +8,11 @@ use std::sync::Arc;
 
 use prost::Message;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tracing::Instrument;
 
 use crate::error;
 use crate::error::Error;
-use crate::frame::{self, Frame, flags};
+use crate::frame::{self, Frame, TraceContext, flags};
 
 /// Maximum buffered bytes for a unary response payload.
 const MAX_UNARY_RESPONSE_PAYLOAD: usize = 4 * 1024 * 1024;
@@ -270,24 +271,38 @@ impl MuxChannel {
         method: u8,
         req: &Req,
     ) -> Result<Resp, Error> {
-        let (stream_id, mut rx) = self.alloc_and_register_stream().await?;
+        let span = tracing::info_span!(
+            "ws_mux.call",
+            stream_id = tracing::field::Empty,
+            method,
+            kind = "unary",
+        );
 
-        // Send OPEN|END with method index + encoded request.
-        let payload = frame::build_open_payload(method, &req.encode_to_vec());
-        let frame = Frame {
-            stream_id,
-            flags: flags::OPEN | flags::END,
-            payload,
-        };
-        if let Err(e) = self.send_raw(frame.encode()).await {
+        async {
+            let (stream_id, mut rx) = self.alloc_and_register_stream().await?;
+            tracing::Span::current().record("stream_id", stream_id);
+
+            // Send OPEN|END with method index + trace context + encoded request.
+            let trace_ctx = TraceContext::current();
+            let payload =
+                frame::build_open_payload(method, &trace_ctx, &req.encode_to_vec());
+            let frame = Frame {
+                stream_id,
+                flags: flags::OPEN | flags::END,
+                payload,
+            };
+            if let Err(e) = self.send_raw(frame.encode()).await {
+                let _ = self.deregister_stream(stream_id).await;
+                return Err(e);
+            }
+
+            // Wait for the response frame(s).
+            let resp = recv_unary_response::<Resp>(&mut rx).await;
             let _ = self.deregister_stream(stream_id).await;
-            return Err(e);
+            resp
         }
-
-        // Wait for the response frame(s).
-        let resp = recv_unary_response::<Resp>(&mut rx).await;
-        let _ = self.deregister_stream(stream_id).await;
-        resp
+        .instrument(span)
+        .await
     }
 
     /// Initiate a server-streaming RPC call.
@@ -298,26 +313,40 @@ impl MuxChannel {
         method: u8,
         req: &Req,
     ) -> Result<Streaming, Error> {
-        let (stream_id, rx) = self.alloc_and_register_stream().await?;
+        let span = tracing::info_span!(
+            "ws_mux.call",
+            stream_id = tracing::field::Empty,
+            method,
+            kind = "server_streaming",
+        );
 
-        // Send OPEN|END with method index + encoded request.
-        let payload = frame::build_open_payload(method, &req.encode_to_vec());
-        let frame = Frame {
-            stream_id,
-            flags: flags::OPEN | flags::END,
-            payload,
-        };
-        if let Err(e) = self.send_raw(frame.encode()).await {
-            let _ = self.deregister_stream(stream_id).await;
-            return Err(e);
+        async {
+            let (stream_id, rx) = self.alloc_and_register_stream().await?;
+            tracing::Span::current().record("stream_id", stream_id);
+
+            // Send OPEN|END with method index + trace context + encoded request.
+            let trace_ctx = TraceContext::current();
+            let payload =
+                frame::build_open_payload(method, &trace_ctx, &req.encode_to_vec());
+            let frame = Frame {
+                stream_id,
+                flags: flags::OPEN | flags::END,
+                payload,
+            };
+            if let Err(e) = self.send_raw(frame.encode()).await {
+                let _ = self.deregister_stream(stream_id).await;
+                return Err(e);
+            }
+
+            Ok(Streaming {
+                channel: self.clone(),
+                stream_id,
+                rx,
+                ended: false,
+            })
         }
-
-        Ok(Streaming {
-            channel: self.clone(),
-            stream_id,
-            rx,
-            ended: false,
-        })
+        .instrument(span)
+        .await
     }
 
     /// Initiate a client-streaming RPC call.
@@ -328,36 +357,49 @@ impl MuxChannel {
         &self,
         method: u8,
     ) -> Result<(StreamingSender, ResponseFuture), Error> {
-        let (stream_id, rx) = self.alloc_and_register_stream().await?;
+        let span = tracing::info_span!(
+            "ws_mux.call",
+            stream_id = tracing::field::Empty,
+            method,
+            kind = "client_streaming",
+        );
 
-        // Send OPEN (without END) with method index and empty payload.
-        let payload = frame::build_open_payload(method, &[]);
-        let frame = Frame {
-            stream_id,
-            flags: flags::OPEN,
-            payload,
-        };
-        if let Err(e) = self.send_raw(frame.encode()).await {
-            let _ = self.deregister_stream(stream_id).await;
-            return Err(e);
+        async {
+            let (stream_id, rx) = self.alloc_and_register_stream().await?;
+            tracing::Span::current().record("stream_id", stream_id);
+
+            // Send OPEN (without END) with method index + trace context and empty payload.
+            let trace_ctx = TraceContext::current();
+            let payload = frame::build_open_payload(method, &trace_ctx, &[]);
+            let frame = Frame {
+                stream_id,
+                flags: flags::OPEN,
+                payload,
+            };
+            if let Err(e) = self.send_raw(frame.encode()).await {
+                let _ = self.deregister_stream(stream_id).await;
+                return Err(e);
+            }
+
+            let (done_tx, done_rx) = oneshot::channel();
+
+            let sender = StreamingSender {
+                channel: self.clone(),
+                stream_id,
+                done: Some(done_tx),
+            };
+
+            let resp_future = ResponseFuture {
+                channel: self.clone(),
+                stream_id,
+                rx,
+                sender_done: Some(done_rx),
+            };
+
+            Ok((sender, resp_future))
         }
-
-        let (done_tx, done_rx) = oneshot::channel();
-
-        let sender = StreamingSender {
-            channel: self.clone(),
-            stream_id,
-            done: Some(done_tx),
-        };
-
-        let resp_future = ResponseFuture {
-            channel: self.clone(),
-            stream_id,
-            rx,
-            sender_done: Some(done_rx),
-        };
-
-        Ok((sender, resp_future))
+        .instrument(span)
+        .await
     }
 }
 
@@ -726,7 +768,7 @@ mod tests {
         tx.send(Frame {
             stream_id: 1,
             flags: flags::OPEN | flags::END,
-            payload: frame::build_open_payload(0, &[]),
+            payload: frame::build_open_payload(0, &TraceContext::default(), &[]),
         })
         .await
         .expect("send test frame");
