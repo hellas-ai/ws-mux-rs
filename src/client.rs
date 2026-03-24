@@ -94,43 +94,40 @@ impl MuxChannel {
     /// Route an incoming frame to the correct stream receiver.
     ///
     /// Called by the background reader task for each received WebSocket message.
-    #[cfg(not(target_arch = "wasm32"))]
     pub async fn route_frame(&self, frame: Frame) {
         let stream_id = frame.stream_id;
-        let tx = {
-            let streams = self.inner.streams.lock().await;
-            streams.get(&stream_id).cloned()
-        };
+        let tx = self.lookup_stream(stream_id).await;
         self.dispatch_frame(stream_id, tx, frame).await;
     }
 
-    /// Route an incoming frame synchronously (wasm32 only).
+    /// Route an incoming frame synchronously on wasm32.
     ///
-    /// Avoids `spawn_local` overhead in the browser `onmessage` callback.
-    /// Safe because wasm32 is single-threaded — no lock contention.
+    /// This fast-path is intended for JavaScript callback contexts such as
+    /// `WebSocket.onmessage`, where avoiding per-frame task spawning matters.
     #[cfg(target_arch = "wasm32")]
-    pub fn route_frame(&self, frame: Frame) {
+    pub fn route_frame_sync(&self, frame: Frame) {
         let stream_id = frame.stream_id;
-        let tx = self.inner.streams.borrow().get(&stream_id).cloned();
-        // For the full-queue RST path we need async send_raw, but this is
-        // rare enough that spawn_local is acceptable here.
-        if let Some(tx) = tx {
-            match tx.try_send(frame) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    tracing::debug!(stream_id, "receiver dropped for stream");
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!(stream_id, "response stream queue full, cancelling stream");
-                    self.inner.streams.borrow_mut().remove(&stream_id);
-                }
-            }
-        } else {
-            tracing::debug!(stream_id, "no receiver for frame, dropping");
-        }
+        let tx = self.lookup_stream_now(stream_id);
+        self.dispatch_frame_sync(stream_id, tx, frame);
     }
 
-    /// Shared frame dispatch logic (native only — wasm inlines this).
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn lookup_stream(&self, stream_id: u32) -> Option<mpsc::Sender<Frame>> {
+        let streams = self.inner.streams.lock().await;
+        streams.get(&stream_id).cloned()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn lookup_stream(&self, stream_id: u32) -> Option<mpsc::Sender<Frame>> {
+        self.lookup_stream_now(stream_id)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn lookup_stream_now(&self, stream_id: u32) -> Option<mpsc::Sender<Frame>> {
+        self.inner.streams.borrow().get(&stream_id).cloned()
+    }
+
+    /// Shared frame dispatch logic.
     #[cfg(not(target_arch = "wasm32"))]
     async fn dispatch_frame(&self, stream_id: u32, tx: Option<mpsc::Sender<Frame>>, frame: Frame) {
         if let Some(tx) = tx {
@@ -156,23 +153,71 @@ impl MuxChannel {
         }
     }
 
+    /// Shared frame dispatch logic.
+    #[cfg(target_arch = "wasm32")]
+    async fn dispatch_frame(&self, stream_id: u32, tx: Option<mpsc::Sender<Frame>>, frame: Frame) {
+        if let Some(tx) = tx {
+            match tx.try_send(frame) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!(stream_id, "receiver dropped for stream");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(stream_id, "response stream queue full, cancelling stream");
+                    if self.deregister_stream(stream_id).await {
+                        let _ = self
+                            .send_raw(
+                                Self::cancellation_frame(stream_id, "response stream queue full")
+                                    .encode(),
+                            )
+                            .await;
+                    }
+                }
+            }
+        } else {
+            tracing::debug!(stream_id, "no receiver for frame, dropping");
+        }
+    }
+
+    /// Synchronous wasm32 frame dispatch for callback-driven transports.
+    #[cfg(target_arch = "wasm32")]
+    fn dispatch_frame_sync(&self, stream_id: u32, tx: Option<mpsc::Sender<Frame>>, frame: Frame) {
+        if let Some(tx) = tx {
+            match tx.try_send(frame) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!(stream_id, "receiver dropped for stream");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(stream_id, "response stream queue full, cancelling stream");
+                    if self.deregister_stream_now(stream_id) {
+                        self.schedule_cancellation_frame(stream_id, "response stream queue full");
+                    }
+                }
+            }
+        } else {
+            tracing::debug!(stream_id, "no receiver for frame, dropping");
+        }
+    }
+
     /// Decode a raw WebSocket message and route it to the correct stream.
     ///
     /// Convenience wrapper around [`Frame::decode`] + [`route_frame`](Self::route_frame).
     /// Designed for push-based transports such as the Cloudflare Workers
     /// `websocket_message` hibernation callback.
-    #[cfg(not(target_arch = "wasm32"))]
     pub async fn receive(&self, data: &[u8]) -> Result<(), Error> {
         let frame = Frame::decode(data)?;
         self.route_frame(frame).await;
         Ok(())
     }
 
-    /// Decode a raw WebSocket message and route it synchronously (wasm32).
+    /// Decode a raw WebSocket message and route it synchronously on wasm32.
+    ///
+    /// This is the callback-friendly fast-path variant of [`receive`](Self::receive).
     #[cfg(target_arch = "wasm32")]
-    pub fn receive(&self, data: &[u8]) -> Result<(), Error> {
+    pub fn receive_sync(&self, data: &[u8]) -> Result<(), Error> {
         let frame = Frame::decode(data)?;
-        self.route_frame(frame);
+        self.route_frame_sync(frame);
         Ok(())
     }
 
@@ -237,6 +282,11 @@ impl MuxChannel {
     /// Remove a stream from the dispatch table (wasm32 — synchronous).
     #[cfg(target_arch = "wasm32")]
     async fn deregister_stream(&self, stream_id: u32) -> bool {
+        self.deregister_stream_now(stream_id)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn deregister_stream_now(&self, stream_id: u32) -> bool {
         self.inner.streams.borrow_mut().remove(&stream_id).is_some()
     }
 
@@ -265,8 +315,20 @@ impl MuxChannel {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn cleanup_stream_on_drop(&self, stream_id: u32, _send_rst: bool) {
-        self.inner.streams.borrow_mut().remove(&stream_id);
+    fn cleanup_stream_on_drop(&self, stream_id: u32, send_rst: bool) {
+        if self.deregister_stream_now(stream_id) && send_rst {
+            self.schedule_cancellation_frame(stream_id, "cancelled");
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn schedule_cancellation_frame(&self, stream_id: u32, message: &'static str) {
+        let channel = self.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = channel
+                .send_raw(Self::cancellation_frame(stream_id, message).encode())
+                .await;
+        });
     }
 
     /// Send raw bytes through the WebSocket sink.
