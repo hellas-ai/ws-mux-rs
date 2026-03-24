@@ -47,6 +47,12 @@ proc-macro2 = "1"
 quote = "1"
 
 [dev-dependencies]
+futures-channel = "0.3"
 futures-util = "0.3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
 prost = "0.14"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.58"

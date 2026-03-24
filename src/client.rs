@@ -128,33 +128,6 @@ impl MuxChannel {
     }
 
     /// Shared frame dispatch logic.
-    #[cfg(not(target_arch = "wasm32"))]
-    async fn dispatch_frame(&self, stream_id: u32, tx: Option<mpsc::Sender<Frame>>, frame: Frame) {
-        if let Some(tx) = tx {
-            match tx.try_send(frame) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    tracing::debug!(stream_id, "receiver dropped for stream");
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!(stream_id, "response stream queue full, cancelling stream");
-                    if self.deregister_stream(stream_id).await {
-                        let _ = self
-                            .send_raw(
-                                Self::cancellation_frame(stream_id, "response stream queue full")
-                                    .encode(),
-                            )
-                            .await;
-                    }
-                }
-            }
-        } else {
-            tracing::debug!(stream_id, "no receiver for frame, dropping");
-        }
-    }
-
-    /// Shared frame dispatch logic.
-    #[cfg(target_arch = "wasm32")]
     async fn dispatch_frame(&self, stream_id: u32, tx: Option<mpsc::Sender<Frame>>, frame: Frame) {
         if let Some(tx) = tx {
             match tx.try_send(frame) {
