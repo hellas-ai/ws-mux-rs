@@ -7,7 +7,6 @@ use wasm_bindgen::prelude::*;
 
 use crate::client::{MuxChannel, SendFn};
 use crate::error::Error;
-use crate::frame::Frame;
 
 impl MuxChannel {
     /// Connect to a WebSocket URL from wasm32 and set up the multiplexing channel.
@@ -88,7 +87,7 @@ impl MuxChannel {
 
         let channel = MuxChannel::new(send_fn);
 
-        // Install onmessage to route frames.
+        // Install onmessage to use the synchronous callback fast-path.
         let channel_clone = channel.clone();
         let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
             move |event: web_sys::MessageEvent| {
@@ -96,16 +95,8 @@ impl MuxChannel {
                     return;
                 };
                 let data = Uint8Array::new(&buf).to_vec();
-                match Frame::decode(&data) {
-                    Ok(frame) => {
-                        let ch = channel_clone.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            ch.route_frame(frame).await;
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "bad frame from server (wasm)");
-                    }
+                if let Err(e) = channel_clone.receive_sync(&data) {
+                    tracing::warn!(error = %e, "bad frame from server (wasm)");
                 }
             },
         );
