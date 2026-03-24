@@ -7,7 +7,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use prost::Message;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
+
+/// Stream dispatch table: `Mutex` on native (multi-threaded), `RefCell` on wasm32
+/// (single-threaded — avoids async locking overhead and `spawn_local` re-entrancy).
+#[cfg(not(target_arch = "wasm32"))]
+type StreamMap = tokio::sync::Mutex<HashMap<u32, mpsc::Sender<Frame>>>;
+#[cfg(target_arch = "wasm32")]
+type StreamMap = std::cell::RefCell<HashMap<u32, mpsc::Sender<Frame>>>;
 use tracing::Instrument;
 
 use crate::error;
@@ -51,7 +58,7 @@ struct Inner {
     /// Write side of the WebSocket (type-erased).
     send_fn: SendFn,
     /// Per-stream dispatch: incoming frames are routed here by the background reader.
-    streams: Mutex<HashMap<u32, mpsc::Sender<Frame>>>,
+    streams: StreamMap,
 }
 
 impl MuxChannel {
@@ -65,7 +72,7 @@ impl MuxChannel {
             inner: Shared::new(Inner {
                 next_stream_id: AtomicU32::new(1),
                 send_fn,
-                streams: Mutex::new(HashMap::new()),
+                streams: StreamMap::new(HashMap::new()),
             }),
         }
     }
@@ -79,7 +86,7 @@ impl MuxChannel {
             inner: Shared::new(Inner {
                 next_stream_id: AtomicU32::new(2),
                 send_fn,
-                streams: Mutex::new(HashMap::new()),
+                streams: StreamMap::new(HashMap::new()),
             }),
         }
     }
@@ -87,12 +94,45 @@ impl MuxChannel {
     /// Route an incoming frame to the correct stream receiver.
     ///
     /// Called by the background reader task for each received WebSocket message.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn route_frame(&self, frame: Frame) {
         let stream_id = frame.stream_id;
         let tx = {
             let streams = self.inner.streams.lock().await;
             streams.get(&stream_id).cloned()
         };
+        self.dispatch_frame(stream_id, tx, frame).await;
+    }
+
+    /// Route an incoming frame synchronously (wasm32 only).
+    ///
+    /// Avoids `spawn_local` overhead in the browser `onmessage` callback.
+    /// Safe because wasm32 is single-threaded — no lock contention.
+    #[cfg(target_arch = "wasm32")]
+    pub fn route_frame(&self, frame: Frame) {
+        let stream_id = frame.stream_id;
+        let tx = self.inner.streams.borrow().get(&stream_id).cloned();
+        // For the full-queue RST path we need async send_raw, but this is
+        // rare enough that spawn_local is acceptable here.
+        if let Some(tx) = tx {
+            match tx.try_send(frame) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!(stream_id, "receiver dropped for stream");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(stream_id, "response stream queue full, cancelling stream");
+                    self.inner.streams.borrow_mut().remove(&stream_id);
+                }
+            }
+        } else {
+            tracing::debug!(stream_id, "no receiver for frame, dropping");
+        }
+    }
+
+    /// Shared frame dispatch logic (native only — wasm inlines this).
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn dispatch_frame(&self, stream_id: u32, tx: Option<mpsc::Sender<Frame>>, frame: Frame) {
         if let Some(tx) = tx {
             match tx.try_send(frame) {
                 Ok(()) => {}
@@ -121,9 +161,18 @@ impl MuxChannel {
     /// Convenience wrapper around [`Frame::decode`] + [`route_frame`](Self::route_frame).
     /// Designed for push-based transports such as the Cloudflare Workers
     /// `websocket_message` hibernation callback.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn receive(&self, data: &[u8]) -> Result<(), Error> {
         let frame = Frame::decode(data)?;
         self.route_frame(frame).await;
+        Ok(())
+    }
+
+    /// Decode a raw WebSocket message and route it synchronously (wasm32).
+    #[cfg(target_arch = "wasm32")]
+    pub fn receive(&self, data: &[u8]) -> Result<(), Error> {
+        let frame = Frame::decode(data)?;
+        self.route_frame(frame);
         Ok(())
     }
 
@@ -133,6 +182,7 @@ impl MuxChannel {
     }
 
     /// Allocate and register a new stream receiver, retrying collisions.
+    #[cfg(not(target_arch = "wasm32"))]
     async fn alloc_and_register_stream(&self) -> Result<(u32, mpsc::Receiver<Frame>), Error> {
         for _ in 0..MAX_STREAM_ID_ALLOCATION_ATTEMPTS {
             let stream_id = self.alloc_stream_id();
@@ -144,7 +194,26 @@ impl MuxChannel {
             }
             tracing::warn!(stream_id, "stream ID collision, retrying allocation");
         }
+        Err(Error::Protocol(
+            "unable to allocate stream ID without collision".into(),
+        ))
+    }
 
+    /// Allocate and register a new stream receiver (wasm32 — synchronous RefCell).
+    ///
+    /// Wrapped in an async fn so callers don't need cfg gates.
+    #[cfg(target_arch = "wasm32")]
+    async fn alloc_and_register_stream(&self) -> Result<(u32, mpsc::Receiver<Frame>), Error> {
+        for _ in 0..MAX_STREAM_ID_ALLOCATION_ATTEMPTS {
+            let stream_id = self.alloc_stream_id();
+            let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
+            let mut streams = self.inner.streams.borrow_mut();
+            if let std::collections::hash_map::Entry::Vacant(entry) = streams.entry(stream_id) {
+                entry.insert(tx);
+                return Ok((stream_id, rx));
+            }
+            tracing::warn!(stream_id, "stream ID collision, retrying allocation");
+        }
         Err(Error::Protocol(
             "unable to allocate stream ID without collision".into(),
         ))
@@ -160,8 +229,15 @@ impl MuxChannel {
     }
 
     /// Remove a stream from the dispatch table.
+    #[cfg(not(target_arch = "wasm32"))]
     async fn deregister_stream(&self, stream_id: u32) -> bool {
         self.inner.streams.lock().await.remove(&stream_id).is_some()
+    }
+
+    /// Remove a stream from the dispatch table (wasm32 — synchronous).
+    #[cfg(target_arch = "wasm32")]
+    async fn deregister_stream(&self, stream_id: u32) -> bool {
+        self.inner.streams.borrow_mut().remove(&stream_id).is_some()
     }
 
     fn cancellation_frame(stream_id: u32, message: &'static str) -> Frame {
@@ -190,9 +266,7 @@ impl MuxChannel {
 
     #[cfg(target_arch = "wasm32")]
     fn cleanup_stream_on_drop(&self, stream_id: u32, _send_rst: bool) {
-        if let Ok(mut streams) = self.inner.streams.try_lock() {
-            streams.remove(&stream_id);
-        }
+        self.inner.streams.borrow_mut().remove(&stream_id);
     }
 
     /// Send raw bytes through the WebSocket sink.
@@ -261,8 +335,14 @@ impl MuxChannel {
     /// This wakes all pending RPC receivers with [`Error::Closed`]. Embedders
     /// using custom transports should call this when their WebSocket or
     /// equivalent transport reaches EOF or a terminal error state.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn transport_closed(&self) {
         self.inner.streams.lock().await.clear();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn transport_closed(&self) {
+        self.inner.streams.borrow_mut().clear();
     }
 
     /// Perform a unary RPC call.

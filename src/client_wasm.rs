@@ -88,7 +88,8 @@ impl MuxChannel {
 
         let channel = MuxChannel::new(send_fn);
 
-        // Install onmessage to route frames.
+        // Install onmessage to route frames synchronously — no spawn_local,
+        // no async Mutex contention, no re-entrancy risk on the externref slab.
         let channel_clone = channel.clone();
         let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
             move |event: web_sys::MessageEvent| {
@@ -98,10 +99,7 @@ impl MuxChannel {
                 let data = Uint8Array::new(&buf).to_vec();
                 match Frame::decode(&data) {
                     Ok(frame) => {
-                        let ch = channel_clone.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            ch.route_frame(frame).await;
-                        });
+                        channel_clone.route_frame(frame);
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "bad frame from server (wasm)");
