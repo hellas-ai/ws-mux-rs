@@ -75,7 +75,7 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-wasm
 
     - name: Install wasm-bindgen test runner
-      run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
+      run: cargo install wasm-bindgen-cli --version 0.2.118 --locked
 
     - name: Run wasm client tests
       env:
